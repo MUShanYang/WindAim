@@ -32,7 +32,8 @@ client.describeModule(MOD,
     "Aim at the closest point on the hitbox.\n\n" +
     "- **WindMouse**: curved human-like path\n" +
     "- **Lock**: snap onto the box\n" +
-    "- **Dynamic**: raise mouse sense while acquiring, slow it on the box"
+    "- **Dynamic**: raise mouse sense while acquiring, slow it on the box\n" +
+    "- **Hit Lock**: Smart keeps the last player you hit"
 );
 
 client.registerMode(MOD, "Mode", "WindMouse", "WindMouse", "Lock", "Dynamic");
@@ -43,6 +44,7 @@ client.registerMode(MOD, "Select", "Angle", "Angle", "Distance", "Smart");
 try {
     client.appendMode(MOD + ":Select", "Smart");
 } catch (e) {}
+client.registerSlider(MOD, "Hit Lock", 0.5, 0, 2, 0.05);
 client.registerSlider(MOD, "FOV", 90, 10, 360, 1);
 client.registerMode(MOD, "Axis", "Both", "Both", "X", "Y");
 client.registerBoolean(MOD, "Hold Attack", true);
@@ -93,6 +95,8 @@ var stickyBoxC = null;
 var carryYaw = 0;
 var carryPitch = 0;
 var carryReady = false;
+var hitLockId = -1;
+var hitLockUntil = 0;
 
 function n(label) {
     return client.getNumber(MOD + ":" + label);
@@ -304,6 +308,8 @@ function clearAim() {
     stickyAim = null;
     stickyBoxC = null;
     carryReady = false;
+    hitLockId = -1;
+    hitLockUntil = 0;
 }
 
 function syncSense(player) {
@@ -399,6 +405,12 @@ function followDest(yaw, pitch, dt) {
         destSmooth.ready = true;
         return destSmooth;
     }
+    var err = hypot2(wrapDeg(yaw - destSmooth.yaw), pitch - destSmooth.pitch);
+    if (err < 0.3) {
+        destSmooth.yaw = yaw;
+        destSmooth.pitch = pitch;
+        return destSmooth;
+    }
     var k = 1 - Math.exp(-dt / 0.032);
     destSmooth.yaw += wrapDeg(yaw - destSmooth.yaw) * k;
     destSmooth.pitch += (pitch - destSmooth.pitch) * k;
@@ -422,7 +434,16 @@ function expStep(destX, destY, speed, dt, noisy) {
     }
     dx = wrapDeg(destX + wind.wx - wind.x);
     dy = destY + wind.wy - wind.y;
+    dist = hypot2(dx, dy);
+    if (dist < 0.28) {
+        wind.x = destX + wind.wx;
+        wind.y = clamp(destY + wind.wy, -90, 90);
+        wind.vx = 0;
+        wind.vy = 0;
+        return;
+    }
     var k = 1 - Math.exp(-dt / tau);
+    if (dist < 1.6) k = Math.max(k, 0.42);
     wind.x += dx * k;
     wind.y = clamp(wind.y + dy * k, -90, 90);
     wind.vx = dt > 1e-4 ? dx * k / dt : 0;
@@ -942,6 +963,16 @@ function pickSmart(player) {
     var eyeX = player.getX();
     var eyeY = player.getEyeY();
     var eyeZ = player.getZ();
+    if (hitLockId !== -1 && System.nanoTime() < hitLockUntil) {
+        var locked = mc.level.getEntity(hitLockId);
+        var lockPt = stillValidCheap(locked, player, 40, lookYaw, lookPitch);
+        if (lockPt && (!b("Walls") || !wallBetween(eyeX, eyeY, eyeZ, lockPt.x, lockPt.y, lockPt.z))) {
+            return locked;
+        }
+    } else {
+        hitLockId = -1;
+        hitLockUntil = 0;
+    }
     var entities = listEntities();
     var ahead = 0.18;
     var predYaw = lookYaw + flickYawRate * ahead;
@@ -1091,11 +1122,11 @@ function onRender(partialTicks) {
     var eye = lerpEntity(player, pt);
     var eyeY = eye.y + player.getEyeHeight();
     var hit = aimPoint(target, eye.x, eyeY, eye.z, pt, pred);
-    var onBox = lookOnBox(player, target, pt, null, 0.12);
+    var onBox = lookOnBox(player, target, pt, null, 0);
     if (onBox) {
         latched = true;
         acquired = true;
-    } else if (latched && !lookOnBox(player, target, pt, null, 0.4)) {
+    } else if (latched && !lookOnBox(player, target, pt, null, 0.22)) {
         latched = false;
     }
     var mode = client.getMode(MOD + ":Mode");
@@ -1214,6 +1245,18 @@ events.on("tick", function () {
         cachedTargetId = -1;
         log("[WindAim] " + e);
     }
+});
+
+events.on("attackEntity", function (entity) {
+    try {
+        if (!client.isEnabled(MOD)) return;
+        if (client.getMode(MOD + ":Select") !== "Smart") return;
+        var dur = n("Hit Lock");
+        if (dur <= 0) return;
+        if (!entity || !Java.isType(entity, Player)) return;
+        hitLockId = entity.getId();
+        hitLockUntil = System.nanoTime() + dur * 1e9;
+    } catch (e) {}
 });
 
 events.on("render3d", function (partialTicks) {
