@@ -85,6 +85,8 @@ var rawPitch = 0;
 var rawReady = false;
 var flickYawRate = 0;
 var flickPitchRate = 0;
+var steerYaw = 0;
+var steerPitch = 0;
 
 function n(label) {
     return client.getNumber(MOD + ":" + label);
@@ -151,12 +153,16 @@ function sampleUserMouse(dt) {
         mx = mc.mouseHandler.xpos();
         my = mc.mouseHandler.ypos();
     } catch (e) {
+        steerYaw = 0;
+        steerPitch = 0;
         return;
     }
     if (!mouseInit) {
         lastMx = mx;
         lastMy = my;
         mouseInit = true;
+        steerYaw = 0;
+        steerPitch = 0;
         return;
     }
     var pdx = mx - lastMx;
@@ -167,6 +173,8 @@ function sampleUserMouse(dt) {
         flickYawRate *= 0.35;
         flickPitchRate *= 0.35;
         rawReady = false;
+        steerYaw = 0;
+        steerPitch = 0;
         return;
     }
     var invert = false;
@@ -186,6 +194,8 @@ function sampleUserMouse(dt) {
     if (dt < 0.001) dt = 0.001;
     flickYawRate = flickYawRate * 0.62 + (dyaw / dt) * 0.38;
     flickPitchRate = flickPitchRate * 0.62 + (dpitch / dt) * 0.38;
+    steerYaw = dyaw;
+    steerPitch = dpitch;
 }
 
 function lookDir(yaw, pitch) {
@@ -565,16 +575,35 @@ function rayHitsAABB(ox, oy, oz, dx, dy, dz, box, maxDist) {
     return tmax >= 0 && tmin <= maxDist;
 }
 
-function lookOnBox(player, entity, pt, pred) {
+function lookOnBox(player, entity, pt, pred, inflate) {
     var eye = lerpEntity(player, pt);
     var eyeY = eye.y + player.getEyeHeight();
     var look = player.getLookAngle();
+    var box = worldBox(entity, pt, pred);
+    if (inflate) {
+        box.minX -= inflate;
+        box.minY -= inflate;
+        box.minZ -= inflate;
+        box.maxX += inflate;
+        box.maxY += inflate;
+        box.maxZ += inflate;
+    }
     return rayHitsAABB(
         eye.x, eyeY, eye.z,
         look.x, look.y, look.z,
-        worldBox(entity, pt, pred),
+        box,
         n("Range") + 2
     );
+}
+
+function yieldMouse(player) {
+    if (!wind) return;
+    wind.x = player.getYRot();
+    wind.y = player.getXRot();
+    wind.vx = 0;
+    wind.vy = 0;
+    wind.wx = 0;
+    wind.wy = 0;
 }
 
 function lerpEntity(e, pt) {
@@ -985,13 +1014,17 @@ function onRender(partialTicks) {
     } else {
         debugBox = null;
     }
-    var onBox = lookOnBox(player, target, pt, pred);
+    var onBox = lookOnBox(player, target, pt, null, 0.12);
     if (onBox) acquired = true;
     var eye = lerpEntity(player, pt);
     var eyeY = eye.y + player.getEyeHeight();
     var mode = client.getMode(MOD + ":Mode");
 
     if (mode === "Dynamic") {
+        if (hypot2(steerYaw, steerPitch) > 0.5) {
+            syncSense(player);
+            return;
+        }
         if (b("Stop On Hit") && onBox) {
             syncSense(player);
             return;
@@ -1053,17 +1086,20 @@ function onRender(partialTicks) {
     }
 
     var skippingStop = flick.on && flick.phase === 0;
+    var userSteer = hypot2(steerYaw, steerPitch);
+    if (userSteer > 0.5) {
+        yieldMouse(player);
+        return;
+    }
     if (b("Stop On Hit") && onBox && !skippingStop) {
-        var err = hypot2(wrapDeg(rot.yaw - wind.x), destPitch - wind.y);
-        var spd = hypot2(wind.vx, wind.vy);
-        if (err < 1.4 && spd < 10) {
-            resetWind(player.getYRot(), player.getXRot());
-            return;
-        }
+        yieldMouse(player);
+        return;
     }
 
     if (correcting || mode === "Lock") lockStep(destYaw, destPitch, n("Speed"), dt);
     else windStep(destYaw, destPitch, n("Speed"), dt);
+    wind.x += steerYaw;
+    wind.y = clamp(wind.y + steerPitch, -90, 90);
     applyRot(player, wind.x, clamp(wind.y, -90, 90));
 }
 
