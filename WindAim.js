@@ -39,18 +39,26 @@ client.registerMode(MOD, "Mode", "WindMouse", "WindMouse", "Lock", "Dynamic");
 client.registerSlider(MOD, "Speed", 10, 1, 90, 0.5);
 client.registerSlider(MOD, "Range", 6, 1, 64, 0.5);
 client.registerMultiSelectDefault(MOD, "Targets", ["Players"], "Players", "Living", "Monsters");
-client.registerMode(MOD, "Select", "Angle", "Angle", "Distance");
+client.registerMode(MOD, "Select", "Angle", "Angle", "Distance", "Smart");
+try {
+    client.appendMode(MOD + ":Select", "Smart");
+} catch (e) {}
 client.registerSlider(MOD, "FOV", 90, 10, 360, 1);
 client.registerMode(MOD, "Axis", "Both", "Both", "X", "Y");
 client.registerBoolean(MOD, "Hold Attack", true);
 client.registerMultiSelectDefault(MOD, "Tools", [], "Sword", "Axe", "Pickaxe", "Shovel", "Hoe");
 client.registerBoolean(MOD, "Skip Mining", true);
 client.registerBoolean(MOD, "Stop On Hit", true);
+client.registerSlider(MOD, "Overshoot", 35, 0, 100, 1);
+client.registerSlider(MOD, "Overshoot Dist", 8, 1, 40, 0.5);
 client.registerBoolean(MOD, "Walls", true);
 client.registerBoolean(MOD, "Predict", true);
 client.registerBoolean(MOD, "Predict Box", true);
 try {
     client.hideProperty(MOD + ":Show Predict");
+} catch (e) {}
+try {
+    client.hideProperty(MOD + ":Pull Back");
 } catch (e) {}
 
 var wind = null;
@@ -63,10 +71,20 @@ var lastYaw = 0;
 var lastPitch = 0;
 var senseReady = false;
 var cachedTargetId = -1;
+var acquired = false;
+var flick = { rolled: false, on: false, phase: 0, oy: 0, op: 0 };
 var debugBox = null;
 var wantPlayers = true;
 var wantLiving = false;
 var wantMonsters = false;
+var lastMx = 0;
+var lastMy = 0;
+var mouseInit = false;
+var rawYaw = 0;
+var rawPitch = 0;
+var rawReady = false;
+var flickYawRate = 0;
+var flickPitchRate = 0;
 
 function n(label) {
     return client.getNumber(MOD + ":" + label);
@@ -113,6 +131,86 @@ function frameDt() {
     if (dt < 0.001) dt = 0.001;
     if (dt > 0.05) dt = 0.05;
     return dt;
+}
+
+function mouseToDeg() {
+    var s = 0.5;
+    try {
+        s = mc.options.sensitivity().get();
+    } catch (e) {}
+    if (s > 1) s = 1;
+    if (s < 0) s = 0;
+    var f = s * 0.6 + 0.2;
+    return f * f * f * 8 * 0.15;
+}
+
+function sampleUserMouse(dt) {
+    var mx;
+    var my;
+    try {
+        mx = mc.mouseHandler.xpos();
+        my = mc.mouseHandler.ypos();
+    } catch (e) {
+        return;
+    }
+    if (!mouseInit) {
+        lastMx = mx;
+        lastMy = my;
+        mouseInit = true;
+        return;
+    }
+    var pdx = mx - lastMx;
+    var pdy = my - lastMy;
+    lastMx = mx;
+    lastMy = my;
+    if (!mc.mouseHandler.isMouseGrabbed()) {
+        flickYawRate *= 0.35;
+        flickPitchRate *= 0.35;
+        rawReady = false;
+        return;
+    }
+    var invert = false;
+    try {
+        invert = !!mc.options.invertYMouse().get();
+    } catch (e) {}
+    var scale = mouseToDeg();
+    var dyaw = pdx * scale;
+    var dpitch = (invert ? -pdy : pdy) * scale;
+    if (!rawReady && mc.player) {
+        rawYaw = mc.player.getYRot();
+        rawPitch = mc.player.getXRot();
+        rawReady = true;
+    }
+    rawYaw += dyaw;
+    rawPitch = clamp(rawPitch + dpitch, -90, 90);
+    if (dt < 0.001) dt = 0.001;
+    flickYawRate = flickYawRate * 0.62 + (dyaw / dt) * 0.38;
+    flickPitchRate = flickPitchRate * 0.62 + (dpitch / dt) * 0.38;
+}
+
+function lookDir(yaw, pitch) {
+    var yr = yaw * Math.PI / 180;
+    var pr = pitch * Math.PI / 180;
+    var cp = Math.cos(pr);
+    return {
+        x: -Math.sin(yr) * cp,
+        y: -Math.sin(pr),
+        z: Math.cos(yr) * cp
+    };
+}
+
+function angleFromLook(yaw, pitch, eyeX, eyeY, eyeZ, x, y, z) {
+    var dx = x - eyeX;
+    var dy = y - eyeY;
+    var dz = z - eyeZ;
+    var dist = hypot3(dx, dy, dz);
+    if (dist < 1e-6) return 0;
+    var look = lookDir(yaw, pitch);
+    var dot = (look.x * dx + look.y * dy + look.z * dz) / dist;
+    dot = clamp(dot, -1, 1);
+    var ang = Math.acos(dot) * RAD;
+    if (isNaN(ang)) return 180;
+    return ang;
 }
 
 function holdingAttack() {
@@ -182,6 +280,8 @@ function clearAim() {
     predCache = { id: -1, tick: -1, pos: null };
     senseReady = false;
     cachedTargetId = -1;
+    acquired = false;
+    flick = { rolled: false, on: false, phase: 0, oy: 0, op: 0 };
     debugBox = null;
     predSmooth = { id: -1, tick: -1, from: null, to: null };
 }
@@ -288,6 +388,26 @@ function windStep(destX, destY, speed, dt) {
     }
     wind.x += wind.vx * dt;
     wind.y += wind.vy * dt;
+}
+
+function resetFlick() {
+    flick = { rolled: false, on: false, phase: 0, oy: 0, op: 0 };
+}
+
+function startOvershoot(trueYaw, truePitch) {
+    if (flick.rolled) return;
+    flick.rolled = true;
+    var chance = n("Overshoot");
+    if (chance <= 0 || Math.random() * 100 >= chance) return;
+    var dy = wrapDeg(trueYaw - wind.x);
+    var dp = truePitch - wind.y;
+    var len = hypot2(dy, dp);
+    if (len < 5) return;
+    var extra = n("Overshoot Dist") * (0.75 + Math.random() * 0.5);
+    flick.on = true;
+    flick.phase = 0;
+    flick.oy = wind.x + dy / len * (len + extra);
+    flick.op = clamp(wind.y + dp / len * (len + extra), -89, 89);
 }
 
 function lockStep(destX, destY, speed, dt) {
@@ -652,7 +772,7 @@ function listEntities() {
     }
 }
 
-function stillValidCheap(e, player, slack) {
+function stillValidCheap(e, player, slack, lookYaw, lookPitch) {
     if (!e || isFiltered(e) || !isWanted(e)) return false;
     var eyeX = player.getX();
     var eyeY = player.getEyeY();
@@ -661,7 +781,12 @@ function stillValidCheap(e, player, slack) {
     var dist = hypot3(pt.x - eyeX, pt.y - eyeY, pt.z - eyeZ);
     if (dist > n("Range") || dist < 0.15) return false;
     var view = n("FOV");
-    if (view < 360 && angleToPoint(player, pt.x, pt.y, pt.z) > view * 0.5 + slack) return false;
+    if (view < 360) {
+        var ang = lookYaw != null
+            ? angleFromLook(lookYaw, lookPitch, eyeX, eyeY, eyeZ, pt.x, pt.y, pt.z)
+            : angleToPoint(player, pt.x, pt.y, pt.z);
+        if (ang > view * 0.5 + slack) return false;
+    }
     return pt;
 }
 
@@ -669,6 +794,8 @@ function pickTarget() {
     var player = mc.player;
     var select = client.getMode(MOD + ":Select");
     refreshWanted();
+
+    if (select === "Smart") return pickSmart(player);
 
     if (stickyId !== -1 && select !== "Angle") {
         var held = mc.level.getEntity(stickyId);
@@ -709,6 +836,85 @@ function pickTarget() {
     return null;
 }
 
+function pickSmart(player) {
+    var lookYaw = rawReady ? rawYaw : player.getYRot();
+    var lookPitch = rawReady ? rawPitch : player.getXRot();
+    var flickLen = hypot2(flickYawRate, flickPitchRate);
+    var eyeX = player.getX();
+    var eyeY = player.getEyeY();
+    var eyeZ = player.getZ();
+    var entities = listEntities();
+    var ahead = 0.18;
+    var predYaw = lookYaw + flickYawRate * ahead;
+    var predPitch = clamp(lookPitch + flickPitchRate * ahead, -90, 90);
+    var flicking = flickLen > 40;
+    var ranked = [];
+
+    for (var i = 0; i < entities.length; i++) {
+        var e = entities[i];
+        var hit = stillValidCheap(e, player, flicking ? 20 : 0, lookYaw, lookPitch);
+        if (!hit) continue;
+        var dist = hypot3(hit.x - eyeX, hit.y - eyeY, hit.z - eyeZ);
+        if (!flicking) {
+            ranked.push({ e: e, score: dist, hit: hit, smart: false });
+            continue;
+        }
+        var rot = rotationTo(eyeX, eyeY, eyeZ, hit.x, hit.y, hit.z);
+        var errY = wrapDeg(rot.yaw - lookYaw);
+        var errP = rot.pitch - lookPitch;
+        var errNow = hypot2(errY, errP);
+        var errPred = hypot2(wrapDeg(rot.yaw - predYaw), rot.pitch - predPitch);
+        var align = 0;
+        if (errNow > 0.05) {
+            align = (flickYawRate * errY + flickPitchRate * errP) / (flickLen * errNow);
+        }
+        var box = worldBox(e, 1, null);
+        var dir = lookDir(predYaw, predPitch);
+        var onPath = align > 0.42 && errPred < errNow + 1;
+        var rayHit = rayHitsAABB(eyeX, eyeY, eyeZ, dir.x, dir.y, dir.z, box, n("Range") + 2);
+        if (onPath || rayHit) ranked.push({ e: e, score: dist, hit: hit, smart: true });
+    }
+
+    ranked.sort(function (a, c) {
+        return a.score - c.score;
+    });
+
+    function firstVisible(list) {
+        if (list.length === 0) return null;
+        if (!b("Walls")) return list[0].e;
+        var lim = list.length < 8 ? list.length : 8;
+        for (var j = 0; j < lim; j++) {
+            var cand = list[j];
+            if (!wallBetween(eyeX, eyeY, eyeZ, cand.hit.x, cand.hit.y, cand.hit.z)) return cand.e;
+        }
+        return null;
+    }
+
+    if (flicking) {
+        var flicked = [];
+        for (var k = 0; k < ranked.length; k++) {
+            if (ranked[k].smart) flicked.push(ranked[k]);
+        }
+        var chosen = firstVisible(flicked);
+        if (chosen) return chosen;
+    }
+
+    if (stickyId !== -1) {
+        var held = mc.level.getEntity(stickyId);
+        var heldPt = stillValidCheap(held, player, 25, lookYaw, lookPitch);
+        if (heldPt && (!b("Walls") || !wallBetween(eyeX, eyeY, eyeZ, heldPt.x, heldPt.y, heldPt.z))) {
+            return held;
+        }
+    }
+
+    ranked.sort(function (a, c) {
+        var aa = angleFromLook(lookYaw, lookPitch, eyeX, eyeY, eyeZ, a.hit.x, a.hit.y, a.hit.z);
+        var bb = angleFromLook(lookYaw, lookPitch, eyeX, eyeY, eyeZ, c.hit.x, c.hit.y, c.hit.z);
+        return aa - bb;
+    });
+    return firstVisible(ranked);
+}
+
 function currentTarget() {
     if (cachedTargetId === -1 || !mc.level) return null;
     return mc.level.getEntity(cachedTargetId);
@@ -726,6 +932,8 @@ function applyRot(player, yaw, pitch) {
 
 function onRender(partialTicks) {
     var dt = frameDt();
+    if (mc.player && mc.level) sampleUserMouse(dt);
+    if (!holdingAttack()) rawReady = false;
     if (!client.isEnabled(MOD)) return;
     if (!mc.player || !mc.level) return;
     if (!mc.mouseHandler.isMouseGrabbed()) {
@@ -766,6 +974,8 @@ function onRender(partialTicks) {
         stickyId = id;
         wind = null;
         senseReady = false;
+        acquired = false;
+        resetFlick();
     }
 
     var pred = smoothPred(target, pt);
@@ -776,6 +986,7 @@ function onRender(partialTicks) {
         debugBox = null;
     }
     var onBox = lookOnBox(player, target, pt, pred);
+    if (onBox) acquired = true;
     var eye = lerpEntity(player, pt);
     var eyeY = eye.y + player.getEyeHeight();
     var mode = client.getMode(MOD + ":Mode");
@@ -807,7 +1018,28 @@ function onRender(partialTicks) {
     var destPitch = rot.pitch;
 
     if (!wind) resetWind(player.getYRot(), player.getXRot());
+    startOvershoot(rot.yaw, rot.pitch);
+
     var destYaw = wind.x + wrapDeg(rot.yaw - wind.x);
+    destPitch = rot.pitch;
+    var correcting = false;
+    if (flick.on && flick.phase === 0) {
+        destYaw = wind.x + wrapDeg(flick.oy - wind.x);
+        destPitch = flick.op;
+        var toFake = hypot2(wrapDeg(flick.oy - wind.x), flick.op - wind.y);
+        if (toFake < 2.4 || (acquired && !onBox)) {
+            flick.phase = 1;
+        }
+    }
+    if (flick.on && flick.phase === 1) {
+        correcting = true;
+        destYaw = wind.x + wrapDeg(rot.yaw - wind.x);
+        destPitch = rot.pitch;
+        if (onBox && hypot2(wrapDeg(rot.yaw - wind.x), rot.pitch - wind.y) < 1.6) {
+            flick.on = false;
+        }
+    }
+
     var axis = client.getMode(MOD + ":Axis");
     if (axis === "X") {
         destPitch = wind.y;
@@ -820,7 +1052,8 @@ function onRender(partialTicks) {
         wind.wx = 0;
     }
 
-    if (b("Stop On Hit") && onBox) {
+    var skippingStop = flick.on && flick.phase === 0;
+    if (b("Stop On Hit") && onBox && !skippingStop) {
         var err = hypot2(wrapDeg(rot.yaw - wind.x), destPitch - wind.y);
         var spd = hypot2(wind.vx, wind.vy);
         if (err < 1.4 && spd < 10) {
@@ -829,7 +1062,7 @@ function onRender(partialTicks) {
         }
     }
 
-    if (mode === "Lock") lockStep(destYaw, destPitch, n("Speed"), dt);
+    if (correcting || mode === "Lock") lockStep(destYaw, destPitch, n("Speed"), dt);
     else windStep(destYaw, destPitch, n("Speed"), dt);
     applyRot(player, wind.x, clamp(wind.y, -90, 90));
 }
@@ -865,4 +1098,8 @@ events.on("disable", function (name) {
     motionHist = {};
     lastNs = 0;
     senseReady = false;
+    mouseInit = false;
+    rawReady = false;
+    flickYawRate = 0;
+    flickPitchRate = 0;
 });
