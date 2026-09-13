@@ -65,8 +65,7 @@ var wind = null;
 var stickyId = -1;
 var motionHist = {};
 var lastNs = 0;
-var predCache = { id: -1, tick: -1, pos: null };
-var predSmooth = { id: -1, tick: -1, from: null, to: null };
+var predCache = { id: -1, tick: -1, vx: 0, vy: 0, vz: 0, ticks: 0, air: false };
 var lastYaw = 0;
 var lastPitch = 0;
 var senseReady = false;
@@ -88,6 +87,12 @@ var flickYawRate = 0;
 var flickPitchRate = 0;
 var steerYaw = 0;
 var steerPitch = 0;
+var destSmooth = { yaw: 0, pitch: 0, ready: false };
+var stickyAim = null;
+var stickyBoxC = null;
+var carryYaw = 0;
+var carryPitch = 0;
+var carryReady = false;
 
 function n(label) {
     return client.getNumber(MOD + ":" + label);
@@ -288,14 +293,17 @@ function resetWind(yaw, pitch) {
 function clearAim() {
     wind = null;
     stickyId = -1;
-    predCache = { id: -1, tick: -1, pos: null };
+    predCache = { id: -1, tick: -1, vx: 0, vy: 0, vz: 0, ticks: 0, air: false };
     senseReady = false;
     cachedTargetId = -1;
     acquired = false;
     latched = false;
     flick = { rolled: false, on: false, phase: 0, oy: 0, op: 0 };
     debugBox = null;
-    predSmooth = { id: -1, tick: -1, from: null, to: null };
+    destSmooth = { yaw: 0, pitch: 0, ready: false };
+    stickyAim = null;
+    stickyBoxC = null;
+    carryReady = false;
 }
 
 function syncSense(player) {
@@ -358,85 +366,12 @@ function applyDynamic(player, destYaw, destPitch, onBox) {
     lastPitch = outPitch;
 }
 
-// User mouse is always applied 1:1. Assist pull fades with flick speed
-// and only when the mouse is already moving toward the aim error.
-function assistMix(errYaw, errPitch, sYaw, sPitch) {
-    var steer = hypot2(sYaw, sPitch);
-    var speedGain = 1 / (1 + (steer / 3.2) * (steer / 3.2));
-    if (steer < 0.12) return speedGain;
-    var err = hypot2(errYaw, errPitch);
-    if (err < 0.08) return speedGain;
-    var align = (sYaw * errYaw + sPitch * errPitch) / (steer * err);
-    if (align < 0.08) return 0;
-    return speedGain * align;
-}
-
-function stayFactor() {
-    var intensity = n("Speed") / 10;
-    if (intensity > 2.4) intensity = 2.4;
-    return clamp(0.2 / (0.55 + intensity * 0.12), 0.08, 0.3);
-}
-
-function slideFactor() {
-    var intensity = n("Speed") / 10;
-    if (intensity > 2.4) intensity = 2.4;
-    return clamp(1 - intensity * 0.02, 0.9, 1);
-}
-
-function breakMix(steer) {
-    return 1 - 1 / (1 + (steer / 4.5) * (steer / 4.5));
-}
-
-function adhesionScales(player, target, pt, fromYaw, fromPitch, dYaw, dPitch) {
-    var stay = stayFactor();
-    var slide = slideFactor();
-    stay = stay + (1 - stay) * breakMix(hypot2(dYaw, dPitch));
-    var axis = client.getMode(MOD + ":Axis");
-    if (axis === "Y") dYaw = 0;
-    if (axis === "X") dPitch = 0;
-    if (Math.abs(dYaw) < 0.0005 && Math.abs(dPitch) < 0.0005) {
-        return { sYaw: 1, sPitch: 1 };
-    }
-    var y1 = fromYaw + dYaw;
-    var p1 = clamp(fromPitch + dPitch, -90, 90);
-    var nowOn = lookOnBoxAt(player, target, pt, null, 0.12, fromYaw, fromPitch);
-    var nextOn = lookOnBoxAt(player, target, pt, null, 0.12, y1, p1);
-    if (nextOn) return { sYaw: slide, sPitch: slide };
-    if (!nowOn) return { sYaw: 1, sPitch: 1 };
-    var yawKeep = lookOnBoxAt(player, target, pt, null, 0.12, fromYaw + dYaw, fromPitch);
-    var pitchKeep = lookOnBoxAt(
-        player, target, pt, null, 0.12,
-        fromYaw, clamp(fromPitch + dPitch, -90, 90)
-    );
-    var sYaw = yawKeep ? slide : stay;
-    var sPitch = pitchKeep ? slide : stay;
-    if (yawKeep && pitchKeep) {
-        sYaw = stay;
-        sPitch = stay;
-    }
-    if (axis === "Y") sYaw = 1;
-    if (axis === "X") sPitch = 1;
-    return { sYaw: sYaw, sPitch: sPitch };
-}
-
-function applyAdhesion(player, target, pt) {
-    var yaw = player.getYRot();
-    var pitch = player.getXRot();
-    if (!senseReady) {
-        syncSense(player);
-        return;
-    }
-    var dYaw = wrapDeg(yaw - lastYaw);
-    var dPitch = pitch - lastPitch;
-    var axis = client.getMode(MOD + ":Axis");
-    if (axis === "X") dPitch = 0;
-    if (axis === "Y") dYaw = 0;
-    var ad = adhesionScales(player, target, pt, lastYaw, lastPitch, dYaw, dPitch);
-    var outYaw = lastYaw + dYaw * ad.sYaw;
-    var outPitch = clamp(lastPitch + dPitch * ad.sPitch, -90, 90);
-    applyRot(player, outYaw, outPitch);
-    lastYaw = outYaw;
-    lastPitch = outPitch;
+// Full spring through normal tracking. Fade only on a real swipe so
+// the curve stays intact; mixing with small mouse deltas made it stutter.
+function assistMix(sYaw, sPitch) {
+    var excess = hypot2(sYaw, sPitch) - 2.4;
+    if (excess <= 0) return 1;
+    return 1 / (1 + (excess / 5) * (excess / 5));
 }
 
 function blendWind(ox, oy, ovx, ovy, gain) {
@@ -447,40 +382,55 @@ function blendWind(ox, oy, ovx, ovy, gain) {
     wind.vy = (ovy + (wind.vy - ovy) * gain) * keep;
 }
 
-function windStep(destX, destY, speed, dt) {
-    var dx = destX - wind.x;
+function yieldMouse(player) {
+    if (!wind) return;
+    wind.x = player.getYRot();
+    wind.y = player.getXRot();
+    wind.vx = 0;
+    wind.vy = 0;
+    wind.wx = 0;
+    wind.wy = 0;
+}
+
+function followDest(yaw, pitch, dt) {
+    if (!destSmooth.ready) {
+        destSmooth.yaw = yaw;
+        destSmooth.pitch = pitch;
+        destSmooth.ready = true;
+        return destSmooth;
+    }
+    var k = 1 - Math.exp(-dt / 0.032);
+    destSmooth.yaw += wrapDeg(yaw - destSmooth.yaw) * k;
+    destSmooth.pitch += (pitch - destSmooth.pitch) * k;
+    return destSmooth;
+}
+
+function expStep(destX, destY, speed, dt, noisy) {
+    var t = speed / 90;
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    var tau = noisy ? 0.20 * (1 - t) + 0.042 * t : 0.11 * (1 - t) + 0.024 * t;
+    var dx = wrapDeg(destX - wind.x);
     var dy = destY - wind.y;
     var dist = hypot2(dx, dy);
-    var spd = hypot2(wind.vx, wind.vy);
-    if (dist < 0.02 && spd < 0.8) {
-        wind.x = destX;
-        wind.y = destY;
-        wind.vx = 0;
-        wind.vy = 0;
-        wind.wx = 0;
-        wind.wy = 0;
-        return;
-    }
-
-    if (dist > 15) {
-        wind.wx = wind.wx * 0.9 + (Math.random() * 2 - 1) * 0.25;
-        wind.wy = wind.wy * 0.9 + (Math.random() * 2 - 1) * 0.25;
+    if (noisy && dist > 14) {
+        wind.wx = wind.wx * 0.9 + (Math.random() * 2 - 1) * 0.07;
+        wind.wy = wind.wy * 0.9 + (Math.random() * 2 - 1) * 0.05;
     } else {
-        wind.wx *= 0.82;
-        wind.wy *= 0.82;
+        wind.wx *= 0.86;
+        wind.wy *= 0.86;
     }
+    dx = wrapDeg(destX + wind.wx - wind.x);
+    dy = destY + wind.wy - wind.y;
+    var k = 1 - Math.exp(-dt / tau);
+    wind.x += dx * k;
+    wind.y = clamp(wind.y + dy * k, -90, 90);
+    wind.vx = dt > 1e-4 ? dx * k / dt : 0;
+    wind.vy = dt > 1e-4 ? dy * k / dt : 0;
+}
 
-    var omega = 5 + speed * 0.85;
-    wind.vx += (dx * omega * omega + wind.wx) * dt - 2 * omega * wind.vx * dt;
-    wind.vy += (dy * omega * omega + wind.wy) * dt - 2 * omega * wind.vy * dt;
-    var maxV = 28 + speed * 22;
-    spd = hypot2(wind.vx, wind.vy);
-    if (spd > maxV && spd > 1e-6) {
-        wind.vx *= maxV / spd;
-        wind.vy *= maxV / spd;
-    }
-    wind.x += wind.vx * dt;
-    wind.y += wind.vy * dt;
+function windStep(destX, destY, speed, dt) {
+    expStep(destX, destY, speed, dt, true);
 }
 
 function resetFlick() {
@@ -504,56 +454,12 @@ function startOvershoot(trueYaw, truePitch) {
 }
 
 function lockStep(destX, destY, speed, dt) {
-    var dx = destX - wind.x;
-    var dy = destY - wind.y;
-    var dist = hypot2(dx, dy);
-    var spd = hypot2(wind.vx, wind.vy);
-    if (dist < 0.015 && spd < 0.6) {
-        wind.x = destX;
-        wind.y = destY;
-        wind.vx = 0;
-        wind.vy = 0;
-        return;
-    }
-    var omega = 10 + speed * 1.35;
-    wind.vx += dx * omega * omega * dt - 2 * omega * wind.vx * dt;
-    wind.vy += dy * omega * omega * dt - 2 * omega * wind.vy * dt;
-    var maxV = 50 + speed * 28;
-    spd = hypot2(wind.vx, wind.vy);
-    if (spd > maxV && spd > 1e-6) {
-        wind.vx *= maxV / spd;
-        wind.vy *= maxV / spd;
-    }
-    wind.x += wind.vx * dt;
-    wind.y += wind.vy * dt;
+    expStep(destX, destY, speed, dt, false);
 }
 
 function smoothPred(entity, pt) {
     if (!b("Predict")) return null;
-    var to = predictPos(entity);
-    var tick = mc.player.tickCount;
-    if (predSmooth.id !== entity.getId()) {
-        predSmooth.id = entity.getId();
-        predSmooth.tick = tick;
-        predSmooth.from = to;
-        predSmooth.to = to;
-        return to;
-    }
-    if (predSmooth.tick !== tick) {
-        predSmooth.from = predSmooth.to;
-        predSmooth.to = to;
-        predSmooth.tick = tick;
-    }
-    var a = predSmooth.from;
-    var c = predSmooth.to;
-    if (!a || !c) return to;
-    if (pt < 0) pt = 0;
-    if (pt > 1) pt = 1;
-    return {
-        x: a.x + (c.x - a.x) * pt,
-        y: a.y + (c.y - a.y) * pt,
-        z: a.z + (c.z - a.z) * pt
-    };
+    return predictPos(entity, pt);
 }
 
 function entityName(e) {
@@ -577,20 +483,19 @@ function stripCodes(s) {
 }
 
 function boxOffset(entity, pt, pred) {
-    var dx = 0;
-    var dy = 0;
-    var dz = 0;
-    if (pt != null) {
-        dx += (entity.xo + (entity.getX() - entity.xo) * pt) - entity.getX();
-        dy += (entity.yo + (entity.getY() - entity.yo) * pt) - entity.getY();
-        dz += (entity.zo + (entity.getZ() - entity.zo) * pt) - entity.getZ();
-    }
     if (pred) {
-        dx += pred.x - entity.getX();
-        dy += pred.y - entity.getY();
-        dz += pred.z - entity.getZ();
+        return {
+            dx: pred.x - entity.getX(),
+            dy: pred.y - entity.getY(),
+            dz: pred.z - entity.getZ()
+        };
     }
-    return { dx: dx, dy: dy, dz: dz };
+    if (pt == null) return { dx: 0, dy: 0, dz: 0 };
+    return {
+        dx: (entity.xo + (entity.getX() - entity.xo) * pt) - entity.getX(),
+        dy: (entity.yo + (entity.getY() - entity.yo) * pt) - entity.getY(),
+        dz: (entity.zo + (entity.getZ() - entity.zo) * pt) - entity.getZ()
+    };
 }
 
 function worldBox(entity, pt, pred) {
@@ -631,7 +536,39 @@ function closestOnAABB(box, px, py, pz) {
 }
 
 function aimPoint(entity, eyeX, eyeY, eyeZ, pt, pred) {
-    return closestOnAABB(worldBox(entity, pt, pred), eyeX, eyeY, eyeZ);
+    var box = worldBox(entity, pt, pred);
+    var closest = closestOnAABB(box, eyeX, eyeY, eyeZ);
+    var cx = (box.minX + box.maxX) * 0.5;
+    var cy = (box.minY + box.maxY) * 0.5;
+    var cz = (box.minZ + box.maxZ) * 0.5;
+    if (!stickyAim || !stickyBoxC) {
+        stickyAim = closest;
+        stickyBoxC = { x: cx, y: cy, z: cz };
+        return closest;
+    }
+    stickyAim = {
+        x: stickyAim.x + (cx - stickyBoxC.x),
+        y: stickyAim.y + (cy - stickyBoxC.y),
+        z: stickyAim.z + (cz - stickyBoxC.z)
+    };
+    stickyBoxC = { x: cx, y: cy, z: cz };
+    stickyAim = closestOnAABB(box, stickyAim.x, stickyAim.y, stickyAim.z);
+    var jump = hypot3(
+        stickyAim.x - closest.x,
+        stickyAim.y - closest.y,
+        stickyAim.z - closest.z
+    );
+    var blend = 0;
+    if (!latched && jump > 0.22) blend = jump > 0.7 ? 0.28 : 0.1;
+    if (blend > 0) {
+        stickyAim = {
+            x: stickyAim.x + (closest.x - stickyAim.x) * blend,
+            y: stickyAim.y + (closest.y - stickyAim.y) * blend,
+            z: stickyAim.z + (closest.z - stickyAim.z) * blend
+        };
+        stickyAim = closestOnAABB(box, stickyAim.x, stickyAim.y, stickyAim.z);
+    }
+    return stickyAim;
 }
 
 function rayHitsAABB(ox, oy, oz, dx, dy, dz, box, maxDist) {
@@ -658,10 +595,10 @@ function rayHitsAABB(ox, oy, oz, dx, dy, dz, box, maxDist) {
     return tmax >= 0 && tmin <= maxDist;
 }
 
-function lookOnBoxAt(player, entity, pt, pred, inflate, yaw, pitch) {
+function lookOnBox(player, entity, pt, pred, inflate) {
     var eye = lerpEntity(player, pt);
     var eyeY = eye.y + player.getEyeHeight();
-    var look = yaw == null ? player.getLookAngle() : lookDir(yaw, pitch);
+    var look = player.getLookAngle();
     var box = worldBox(entity, pt, pred);
     if (inflate) {
         box.minX -= inflate;
@@ -677,10 +614,6 @@ function lookOnBoxAt(player, entity, pt, pred, inflate, yaw, pitch) {
         box,
         n("Range") + 2
     );
-}
-
-function lookOnBox(player, entity, pt, pred, inflate) {
-    return lookOnBoxAt(player, entity, pt, pred, inflate, null, null);
 }
 
 function lerpEntity(e, pt) {
@@ -715,37 +648,90 @@ function angleToPoint(player, x, y, z) {
     return ang;
 }
 
-function observedMotion(entity) {
-    return {
-        vx: entity.getX() - entity.xo,
-        vy: entity.getY() - entity.yo,
-        vz: entity.getZ() - entity.zo
-    };
+function entityPing(entity) {
+    var ping = 50;
+    try {
+        var conn = mc.getConnection();
+        ping = conn.getPlayerInfo(mc.player.getUUID()).getLatency();
+        if (Java.isType(entity, Player)) {
+            var theirs = conn.getPlayerInfo(entity.getUUID()).getLatency();
+            if (theirs > 0) ping = (ping + theirs) * 0.5;
+        }
+    } catch (e) {}
+    if (ping < 20) ping = 20;
+    if (ping > 250) ping = 250;
+    return ping;
 }
 
-function isStationary(mot) {
-    var h = hypot2(mot.vx, mot.vz);
-    return hypot3(mot.vx, mot.vy, mot.vz) < 0.03 || (h < 0.02 && Math.abs(mot.vy) < 0.08);
+// Remote players often have xo == x between packets, while getDeltaMovement
+// still has travel speed. Position delta can also spike when lerp catches up.
+function sampleRaw(entity) {
+    var dx = entity.getX() - entity.xo;
+    var dy = entity.getY() - entity.yo;
+    var dz = entity.getZ() - entity.zo;
+    var mx = 0;
+    var mz = 0;
+    try {
+        var mot = entity.getDeltaMovement();
+        mx = mot.x;
+        mz = mot.z;
+    } catch (e) {}
+    var onGround = false;
+    try {
+        onGround = !!entity.onGround();
+    } catch (e2) {}
+    if (onGround || Math.abs(dy) < 0.08) dy = 0;
+    var posH = hypot2(dx, dz);
+    var motH = hypot2(mx, mz);
+    if (posH < 0.012 && motH < 0.02) {
+        return { vx: 0, vy: 0, vz: 0, still: true, air: false };
+    }
+    var vx;
+    var vz;
+    if (posH < 0.012) {
+        vx = mx;
+        vz = mz;
+    } else if (motH > 0.03 && posH > motH * 1.7 + 0.04) {
+        vx = mx;
+        vz = mz;
+    } else {
+        vx = dx;
+        vz = dz;
+    }
+    var cap = 0.42;
+    var h = hypot2(vx, vz);
+    if (h > cap) {
+        vx *= cap / h;
+        vz *= cap / h;
+    }
+    var air = !onGround && Math.abs(dy) > 0.08;
+    return { vx: vx, vy: dy, vz: vz, still: false, air: air };
 }
 
-function updateHist(entity, mot) {
+function updateHist(entity, raw) {
     var id = entity.getId();
     var prev = motionHist[id];
-    var ax = 0;
-    var ay = 0;
-    var az = 0;
-    if (prev) {
-        ax = clamp(prev.ax * 0.5 + (mot.vx - prev.vx) * 0.5, -0.1, 0.1);
-        ay = clamp(prev.ay * 0.5 + (mot.vy - prev.vy) * 0.5, -0.14, 0.14);
-        az = clamp(prev.az * 0.5 + (mot.vz - prev.vz) * 0.5, -0.1, 0.1);
+    var vx = raw.vx;
+    var vy = raw.vy;
+    var vz = raw.vz;
+    var turn = 1;
+    if (prev && !raw.still) {
+        var mag0 = hypot2(prev.vx, prev.vz);
+        var mag1 = hypot2(vx, vz);
+        if (mag0 > 0.02 && mag1 > 0.02) {
+            turn = (prev.vx * vx + prev.vz * vz) / (mag0 * mag1);
+        }
+        if (turn > 0.25) {
+            vx = prev.vx * 0.4 + vx * 0.6;
+            vz = prev.vz * 0.4 + vz * 0.6;
+            vy = prev.vy * 0.4 + vy * 0.6;
+        }
     }
     motionHist[id] = {
-        vx: mot.vx,
-        vy: mot.vy,
-        vz: mot.vz,
-        ax: ax,
-        ay: ay,
-        az: az,
+        vx: vx,
+        vy: vy,
+        vz: vz,
+        turn: turn,
         seen: true
     };
     return motionHist[id];
@@ -758,55 +744,62 @@ function pruneHist() {
     }
 }
 
-function predictPos(entity) {
+function velocityFor(entity) {
     var tick = mc.player.tickCount;
-    if (predCache.id === entity.getId() && predCache.tick === tick && predCache.pos) {
-        return predCache.pos;
+    if (predCache.id === entity.getId() && predCache.tick === tick) {
+        return predCache;
     }
-
-    var x = entity.getX();
-    var y = entity.getY();
-    var z = entity.getZ();
-    var mot = observedMotion(entity);
-    if (isStationary(mot)) {
-        motionHist[entity.getId()] = {
-            vx: 0, vy: 0, vz: 0, ax: 0, ay: 0, az: 0, seen: true
-        };
-        predCache = { id: entity.getId(), tick: tick, pos: { x: x, y: y, z: z } };
-        return predCache.pos;
+    var raw = sampleRaw(entity);
+    var hist = updateHist(entity, raw);
+    var ticks = 0;
+    if (!raw.still) {
+        ticks = 1 + entityPing(entity) / 60;
+        if (hist.turn < 0.15) ticks *= 0.35;
+        else if (hist.turn < 0.5) ticks *= 0.65;
+        if (latched) ticks *= 0.5;
+        if (ticks < 0.8) ticks = 0.8;
+        if (ticks > 4) ticks = 4;
     }
+    predCache = {
+        id: entity.getId(),
+        tick: tick,
+        vx: raw.still ? 0 : hist.vx,
+        vy: raw.still ? 0 : hist.vy,
+        vz: raw.still ? 0 : hist.vz,
+        ticks: ticks,
+        air: raw.air
+    };
+    return predCache;
+}
 
-    var hist = updateHist(entity, mot);
-    var vx = mot.vx;
-    var vy = mot.vy;
-    var vz = mot.vz;
-    var speedH = hypot2(vx, vz);
-    var ticks = clamp(Math.round(speedH * 16), 2, 8);
-    var onGround = entity.onGround() || Math.abs(vy) < 0.08;
-    var airborne = !onGround && Math.abs(vy) > 0.1;
-    var maxKeep = Math.min(Math.max(speedH * 1.05, 0.05), 0.62);
-
-    for (var i = 0; i < ticks; i++) {
-        if (airborne) {
+function predictPos(entity, pt) {
+    if (pt == null || isNaN(pt)) pt = 1;
+    if (pt < 0) pt = 0;
+    if (pt > 1) pt = 1;
+    var x = entity.xo + (entity.getX() - entity.xo) * pt;
+    var y = entity.yo + (entity.getY() - entity.yo) * pt;
+    var z = entity.zo + (entity.getZ() - entity.zo) * pt;
+    var v = velocityFor(entity);
+    if (v.ticks <= 0) return { x: x, y: y, z: z };
+    x += v.vx * v.ticks;
+    z += v.vz * v.ticks;
+    if (v.air) {
+        var vy = v.vy;
+        var n = Math.floor(v.ticks);
+        var frac = v.ticks - n;
+        var i;
+        for (i = 0; i < n; i++) {
             vy = (vy - 0.08) * 0.98;
-            vx *= 0.91;
-            vz *= 0.91;
-        } else {
-            vx += hist.ax;
-            vz += hist.az;
-            vy = 0;
-            var sp = hypot2(vx, vz);
-            if (sp > maxKeep && sp > 1e-6) {
-                vx *= maxKeep / sp;
-                vz *= maxKeep / sp;
-            }
+            y += vy;
         }
-        x += vx;
-        y += vy;
-        z += vz;
+        if (frac > 0) {
+            vy = (vy - 0.08) * 0.98;
+            y += vy * frac;
+        }
+    } else {
+        y += v.vy * v.ticks;
     }
-    predCache = { id: entity.getId(), tick: tick, pos: { x: x, y: y, z: z } };
-    return predCache.pos;
+    return { x: x, y: y, z: z };
 }
 
 function isWanted(entity) {
@@ -1078,10 +1071,13 @@ function onRender(partialTicks) {
     var id = target.getId();
     if (id !== stickyId) {
         stickyId = id;
-        wind = null;
         senseReady = false;
         acquired = false;
         latched = false;
+        destSmooth.ready = false;
+        stickyAim = null;
+        stickyBoxC = null;
+        carryReady = false;
         resetFlick();
     }
 
@@ -1099,32 +1095,24 @@ function onRender(partialTicks) {
     if (onBox) {
         latched = true;
         acquired = true;
-    } else if (latched) {
-        if (!lookOnBox(player, target, pt, null, 0.4)) {
-            latched = false;
-        } else {
-            var leaveAng = angleFromLook(
-                player.getYRot(), player.getXRot(),
-                eye.x, eyeY, eye.z,
-                hit.x, hit.y, hit.z
-            );
-            if (leaveAng > 4) latched = false;
-        }
+    } else if (latched && !lookOnBox(player, target, pt, null, 0.4)) {
+        latched = false;
     }
     var mode = client.getMode(MOD + ":Mode");
 
     if (mode === "Dynamic") {
         if (b("Stop On Hit") && latched) {
-            applyAdhesion(player, target, pt);
+            syncSense(player);
             return;
         }
         var rotD = rotationTo(eye.x, eyeY, eye.z, hit.x, hit.y, hit.z);
+        var aimedD = followDest(rotD.yaw, rotD.pitch, dt);
         var dyaw = senseReady ? lastYaw : player.getYRot();
         applyDynamic(
             player,
-            dyaw + wrapDeg(rotD.yaw - dyaw),
-            rotD.pitch,
-            false
+            dyaw + wrapDeg(aimedD.yaw - dyaw),
+            aimedD.pitch,
+            onBox && !b("Stop On Hit")
         );
         return;
     }
@@ -1135,7 +1123,10 @@ function onRender(partialTicks) {
     startOvershoot(rot.yaw, rot.pitch);
 
     var skippingStop = flick.on && flick.phase === 0;
-    if (skippingStop) latched = false;
+    if (skippingStop) {
+        latched = false;
+        carryReady = false;
+    }
 
     var axis = client.getMode(MOD + ":Axis");
     var dy = steerYaw;
@@ -1143,24 +1134,30 @@ function onRender(partialTicks) {
     if (axis === "Y") dy = 0;
     if (axis === "X") dp = 0;
 
+    if (!latched) carryReady = false;
+
     if (b("Stop On Hit") && latched && !skippingStop) {
         if (flick.on) flick.on = false;
-        var ad = adhesionScales(player, target, pt, wind.x, wind.y, dy, dp);
-        wind.x += dy * ad.sYaw;
-        wind.y = clamp(wind.y + dp * ad.sPitch, -90, 90);
-        wind.vx *= 0.5;
-        wind.vy *= 0.5;
-        wind.wx *= 0.6;
-        wind.wy *= 0.6;
+        if (!carryReady) {
+            carryYaw = rot.yaw;
+            carryPitch = rot.pitch;
+            carryReady = true;
+        } else {
+            wind.x += wrapDeg(rot.yaw - carryYaw);
+            wind.y = clamp(wind.y + (rot.pitch - carryPitch), -90, 90);
+            carryYaw = rot.yaw;
+            carryPitch = rot.pitch;
+        }
+        wind.x += dy;
+        wind.y = clamp(wind.y + dp, -90, 90);
         applyRot(player, wind.x, clamp(wind.y, -90, 90));
         return;
     }
 
-    wind.x += dy;
-    wind.y = clamp(wind.y + dp, -90, 90);
-
-    var destYaw = wind.x + wrapDeg(rot.yaw - wind.x);
-    var destPitch = rot.pitch;
+    if (flick.on) destSmooth.ready = false;
+    var aimed = flick.on ? rot : followDest(rot.yaw, rot.pitch, dt);
+    var destYaw = wind.x + wrapDeg(aimed.yaw - wind.x);
+    var destPitch = aimed.pitch;
     var correcting = false;
     if (flick.on && flick.phase === 0) {
         destYaw = wind.x + wrapDeg(flick.oy - wind.x);
@@ -1190,16 +1187,16 @@ function onRender(partialTicks) {
         wind.wx = 0;
     }
 
-    var errYaw = wrapDeg(destYaw - wind.x);
-    var errPitch = destPitch - wind.y;
-    var gain = assistMix(errYaw, errPitch, dy, dp);
+    var gain = assistMix(dy, dp);
     var ox = wind.x;
     var oy = wind.y;
     var ovx = wind.vx;
     var ovy = wind.vy;
     if (correcting || mode === "Lock") lockStep(destYaw, destPitch, n("Speed"), dt);
     else windStep(destYaw, destPitch, n("Speed"), dt);
-    blendWind(ox, oy, ovx, ovy, gain);
+    if (gain < 0.999) blendWind(ox, oy, ovx, ovy, gain);
+    wind.x += dy;
+    wind.y = clamp(wind.y + dp, -90, 90);
     applyRot(player, wind.x, clamp(wind.y, -90, 90));
 }
 
