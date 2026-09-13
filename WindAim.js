@@ -20,7 +20,7 @@ var RAD = 180 / Math.PI;
 client.registerModule(MOD, -1, "Combat", false);
 client.registerIcon(MOD, 0xf05b);
 client.describeModule(MOD,
-    "Hold attack to aim at the closest point on the hitbox.\n\n" +
+    "Aim at the closest point on the hitbox.\n\n" +
     "- **WindMouse**: curved human-like path\n" +
     "- **Lock**: snap onto the box\n" +
     "- Does nothing while the crosshair is already on the box"
@@ -29,6 +29,7 @@ client.describeModule(MOD,
 client.registerMode(MOD, "Mode", "WindMouse", "WindMouse", "Lock");
 client.registerSlider(MOD, "Speed", 10, 1, 20, 0.5);
 client.registerMultiSelectDefault(MOD, "Targets", ["Players"], "Players", "Living", "Monsters");
+client.registerBoolean(MOD, "Hold", true);
 client.registerBoolean(MOD, "Skip Mining", true);
 
 var wind = null;
@@ -85,6 +86,7 @@ function frameDt() {
 }
 
 function holdingAttack() {
+    if (!b("Hold")) return true;
     try {
         if (mc.options.keyAttack.isDown()) return true;
     } catch (e) {}
