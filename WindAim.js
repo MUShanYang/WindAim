@@ -2,8 +2,6 @@
 // Modes: WindMouse (curved) / Lock (snap) / Dynamic (scale mouse sense per axis).
 
 var MOD = "WindAim";
-var RANGE = 6;
-var FOV = 90;
 
 var LivingEntity = Java.type("net.minecraft.world.entity.LivingEntity");
 var Player = Java.type("net.minecraft.world.entity.player.Player");
@@ -12,8 +10,6 @@ var ArmorStand = Java.type("net.minecraft.world.entity.decoration.ArmorStand");
 var HitType = Java.type("net.minecraft.world.phys.HitResult$Type");
 var System = Java.type("java.lang.System");
 
-var SQRT3 = Math.sqrt(3);
-var SQRT5 = Math.sqrt(5);
 var RAD = 180 / Math.PI;
 
 client.registerModule(MOD, -1, "Combat", false);
@@ -22,15 +18,19 @@ client.describeModule(MOD,
     "Aim at the closest point on the hitbox.\n\n" +
     "- **WindMouse**: curved human-like path\n" +
     "- **Lock**: snap onto the box\n" +
-    "- **Dynamic**: raise mouse sense while acquiring, slow it on the box\n" +
-    "- WindMouse/Lock do nothing while the crosshair is already on the box"
+    "- **Dynamic**: raise mouse sense while acquiring, slow it on the box"
 );
 
 client.registerMode(MOD, "Mode", "WindMouse", "WindMouse", "Lock", "Dynamic");
 client.registerSlider(MOD, "Speed", 10, 1, 20, 0.5);
+client.registerSlider(MOD, "Range", 6, 1, 64, 0.5);
 client.registerMultiSelectDefault(MOD, "Targets", ["Players"], "Players", "Living", "Monsters");
+client.registerMode(MOD, "Select", "Angle", "Angle", "Distance");
+client.registerSlider(MOD, "FOV", 90, 10, 360, 1);
+client.registerMode(MOD, "Axis", "Both", "Both", "X", "Y");
 client.registerBoolean(MOD, "Hold", true);
 client.registerBoolean(MOD, "Skip Mining", true);
+client.registerBoolean(MOD, "Stop On Hit", true);
 
 var wind = null;
 var stickyId = -1;
@@ -90,13 +90,24 @@ function frameDt() {
 
 function holdingAttack() {
     if (!b("Hold")) return true;
+    // KeyMapping.isDown() can stay true after release (clickCount / consumeClick).
+    // Read the bound attack key from GLFW so Hold follows the physical button.
     try {
-        if (mc.options.keyAttack.isDown()) return true;
-    } catch (e) {}
-    try {
-        if (mc.mouseHandler.isLeftPressed()) return true;
-    } catch (e) {}
-    return false;
+        var GLFW = Java.type("org.lwjgl.glfw.GLFW");
+        var handle = mc.getWindow().getWindow();
+        var k = mc.options.keyAttack.getKey();
+        var name = k.getName();
+        if (name && name.indexOf("mouse") >= 0) {
+            return GLFW.glfwGetMouseButton(handle, k.getValue()) === 1;
+        }
+        return GLFW.glfwGetKey(handle, k.getValue()) === 1;
+    } catch (e) {
+        try {
+            return !!mc.mouseHandler.isLeftPressed();
+        } catch (e2) {
+            return false;
+        }
+    }
 }
 
 function isMining() {
@@ -184,6 +195,9 @@ function applyDynamic(player, destYaw, destPitch, onBox) {
 
     var sYaw = axisScale(errYaw, dYaw, onBox, false, intensity);
     var sPitch = axisScale(errPitch, dPitch, onBox, true, intensity);
+    var axis = client.getMode(MOD + ":Axis");
+    if (axis === "X") sPitch = 1;
+    if (axis === "Y") sYaw = 1;
 
     var outYaw = lastYaw + dYaw * sYaw;
     var outPitch = clamp(lastPitch + dPitch * sPitch, -90, 90);
@@ -193,46 +207,39 @@ function applyDynamic(player, destYaw, destPitch, onBox) {
 }
 
 function windStep(destX, destY, speed, dt) {
-    var G = 9;
-    var W = 1.2;
-    var D = 8;
-    var tick = dt * 20;
-
     var dx = destX - wind.x;
     var dy = destY - wind.y;
     var dist = hypot2(dx, dy);
-    if (dist < 0.01) {
+    var spd = hypot2(wind.vx, wind.vy);
+    if (dist < 0.02 && spd < 0.8) {
         wind.x = destX;
         wind.y = destY;
-        wind.vx *= 0.5;
-        wind.vy *= 0.5;
+        wind.vx = 0;
+        wind.vy = 0;
+        wind.wx = 0;
+        wind.wy = 0;
         return;
     }
 
-    if (dist < D) {
-        var t = 1 - Math.exp(-speed * 0.45 * tick);
-        if (t > 1) t = 1;
-        wind.x += dx * t;
-        wind.y += dy * t;
-        wind.vx *= 0.6;
-        wind.vy *= 0.6;
-        wind.wx *= 0.6;
-        wind.wy *= 0.6;
-        return;
+    if (dist > 15) {
+        wind.wx = wind.wx * 0.9 + (Math.random() * 2 - 1) * 0.25;
+        wind.wy = wind.wy * 0.9 + (Math.random() * 2 - 1) * 0.25;
+    } else {
+        wind.wx *= 0.82;
+        wind.wy *= 0.82;
     }
 
-    var wMag = Math.min(W, dist);
-    wind.wx = wind.wx / SQRT3 + (Math.random() * 2 - 1) * wMag / SQRT5;
-    wind.wy = wind.wy / SQRT3 + (Math.random() * 2 - 1) * wMag / SQRT5;
-    wind.vx += (wind.wx + G * dx / dist) * tick;
-    wind.vy += (wind.wy + G * dy / dist) * tick;
-    var vMag = hypot2(wind.vx, wind.vy);
-    if (vMag > speed && vMag > 1e-6) {
-        wind.vx *= speed / vMag;
-        wind.vy *= speed / vMag;
+    var omega = 5 + speed * 0.85;
+    wind.vx += (dx * omega * omega + wind.wx) * dt - 2 * omega * wind.vx * dt;
+    wind.vy += (dy * omega * omega + wind.wy) * dt - 2 * omega * wind.vy * dt;
+    var maxV = 28 + speed * 22;
+    spd = hypot2(wind.vx, wind.vy);
+    if (spd > maxV && spd > 1e-6) {
+        wind.vx *= maxV / spd;
+        wind.vy *= maxV / spd;
     }
-    wind.x += wind.vx * tick;
-    wind.y += wind.vy * tick;
+    wind.x += wind.vx * dt;
+    wind.y += wind.vy * dt;
 }
 
 function entityName(e) {
@@ -345,7 +352,7 @@ function lookOnBox(player, entity, pt, pred) {
         eye.x, eyeY, eye.z,
         look.x, look.y, look.z,
         worldBox(entity, pt, pred),
-        RANGE + 2
+        n("Range") + 2
     );
 }
 
@@ -528,15 +535,17 @@ function stillValid(e, player, slack) {
     var eyeZ = player.getZ();
     var pt = aimPoint(e, eyeX, eyeY, eyeZ, 1, null);
     var dist = hypot3(pt.x - eyeX, pt.y - eyeY, pt.z - eyeZ);
-    if (dist > RANGE || dist < 0.15) return false;
-    if (angleToPoint(player, pt.x, pt.y, pt.z) > FOV * 0.5 + slack) return false;
+    if (dist > n("Range") || dist < 0.15) return false;
+    var view = n("FOV");
+    if (view < 360 && angleToPoint(player, pt.x, pt.y, pt.z) > view * 0.5 + slack) return false;
     return true;
 }
 
 function pickTarget() {
     var player = mc.player;
+    var select = client.getMode(MOD + ":Select");
 
-    if (stickyId !== -1) {
+    if (stickyId !== -1 && select !== "Angle") {
         var held = mc.level.getEntity(stickyId);
         if (stillValid(held, player, 25)) return held;
     }
@@ -548,9 +557,14 @@ function pickTarget() {
         var e = entities[i];
         if (!stillValid(e, player, 0)) continue;
         var hit = aimPoint(e, player.getX(), player.getEyeY(), player.getZ(), 1, null);
-        var ang = angleToPoint(player, hit.x, hit.y, hit.z);
-        if (ang < bestScore) {
-            bestScore = ang;
+        var score;
+        if (select === "Distance") {
+            score = hypot3(hit.x - player.getX(), hit.y - player.getEyeY(), hit.z - player.getZ());
+        } else {
+            score = angleToPoint(player, hit.x, hit.y, hit.z);
+        }
+        if (score < bestScore) {
+            bestScore = score;
             best = e;
         }
     }
@@ -558,11 +572,13 @@ function pickTarget() {
 }
 
 function applyRot(player, yaw, pitch) {
+    var axis = client.getMode(MOD + ":Axis");
+    if (axis === "X") pitch = player.getXRot();
+    if (axis === "Y") yaw = player.getYRot();
     player.setYRot(yaw);
     player.setXRot(pitch);
     player.yRotO = yaw;
     player.xRotO = pitch;
-    client.setRotation(yaw, pitch, 180);
 }
 
 function onRender(partialTicks) {
@@ -611,6 +627,10 @@ function onRender(partialTicks) {
     var mode = client.getMode(MOD + ":Mode");
 
     if (mode === "Dynamic") {
+        if (b("Stop On Hit") && onBox) {
+            syncSense(player);
+            return;
+        }
         var aim;
         if (onBox) {
             aim = boxCenter(worldBox(target, pt, pred));
@@ -628,8 +648,8 @@ function onRender(partialTicks) {
         return;
     }
 
-    if (onBox) {
-        wind = null;
+    if (b("Stop On Hit") && onBox) {
+        if (wind) resetWind(player.getYRot(), player.getXRot());
         return;
     }
 
@@ -645,6 +665,17 @@ function onRender(partialTicks) {
 
     if (!wind) resetWind(player.getYRot(), player.getXRot());
     destYaw = wind.x + wrapDeg(rot.yaw - wind.x);
+    var axis = client.getMode(MOD + ":Axis");
+    if (axis === "X") {
+        destPitch = wind.y;
+        wind.vy = 0;
+        wind.wy = 0;
+    }
+    if (axis === "Y") {
+        destYaw = wind.x;
+        wind.vx = 0;
+        wind.wx = 0;
+    }
     windStep(destYaw, destPitch, n("Speed"), dt);
     applyRot(player, wind.x, clamp(wind.y, -90, 90));
 }
