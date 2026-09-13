@@ -23,6 +23,9 @@ var GLFW = null;
 try {
     GLFW = Java.type("org.lwjgl.glfw.GLFW");
 } catch (e) {}
+var accDXField = null;
+var accDYField = null;
+var accFieldsTried = false;
 
 var RAD = 180 / Math.PI;
 
@@ -97,6 +100,8 @@ var carryPitch = 0;
 var carryReady = false;
 var hitLockId = -1;
 var hitLockUntil = 0;
+var dynSYaw = 1;
+var dynSPitch = 1;
 
 function n(label) {
     return client.getNumber(MOD + ":" + label);
@@ -316,6 +321,8 @@ function syncSense(player) {
     lastYaw = player.getYRot();
     lastPitch = player.getXRot();
     senseReady = true;
+    dynSYaw = 1;
+    dynSPitch = 1;
 }
 
 // Per-axis mouse scale. Same-sign delta vs error = moving toward the aim point.
@@ -344,16 +351,48 @@ function axisScale(error, delta, onBox, isPitch, intensity) {
     return clamp(1 - resist, 0.25, 1);
 }
 
+function mouseAccFields() {
+    if (accFieldsTried) return !!accDXField;
+    accFieldsTried = true;
+    try {
+        var cls = mc.mouseHandler.getClass();
+        try {
+            accDXField = cls.getDeclaredField("f_91516_");
+            accDYField = cls.getDeclaredField("f_91517_");
+        } catch (e) {
+            accDXField = cls.getDeclaredField("accumulatedDX");
+            accDYField = cls.getDeclaredField("accumulatedDY");
+        }
+        accDXField.setAccessible(true);
+        accDYField.setAccessible(true);
+        return true;
+    } catch (e2) {
+        accDXField = null;
+        accDYField = null;
+        return false;
+    }
+}
+
+function clearVanillaMouse() {
+    if (!mouseAccFields()) return;
+    try {
+        accDXField.setDouble(mc.mouseHandler, 0);
+        accDYField.setDouble(mc.mouseHandler, 0);
+    } catch (e) {}
+}
+
 function applyDynamic(player, destYaw, destPitch, onBox) {
-    var yaw = player.getYRot();
-    var pitch = player.getXRot();
+    clearVanillaMouse();
     if (!senseReady) {
-        syncSense(player);
-        return;
+        lastYaw = player.getYRot();
+        lastPitch = player.getXRot();
+        senseReady = true;
+        dynSYaw = 1;
+        dynSPitch = 1;
     }
 
-    var dYaw = wrapDeg(yaw - lastYaw);
-    var dPitch = pitch - lastPitch;
+    var dYaw = steerYaw;
+    var dPitch = steerPitch;
     var errYaw = wrapDeg(destYaw - lastYaw);
     var errPitch = destPitch - lastPitch;
     var intensity = n("Speed") / 10;
@@ -361,15 +400,36 @@ function applyDynamic(player, destYaw, destPitch, onBox) {
 
     var sYaw = axisScale(errYaw, dYaw, onBox, false, intensity);
     var sPitch = axisScale(errPitch, dPitch, onBox, true, intensity);
+    dynSYaw = dynSYaw * 0.5 + sYaw * 0.5;
+    dynSPitch = dynSPitch * 0.5 + sPitch * 0.5;
+    sYaw = dynSYaw;
+    sPitch = dynSPitch;
     var axis = client.getMode(MOD + ":Axis");
     if (axis === "X") sPitch = 1;
     if (axis === "Y") sYaw = 1;
 
-    var outYaw = lastYaw + dYaw * sYaw;
-    var outPitch = clamp(lastPitch + dPitch * sPitch, -90, 90);
-    applyRot(player, outYaw, outPitch);
-    lastYaw = outYaw;
-    lastPitch = outPitch;
+    lastYaw += dYaw * sYaw;
+    lastPitch = clamp(lastPitch + dPitch * sPitch, -90, 90);
+    player.setYRot(lastYaw);
+    player.setXRot(lastPitch);
+    player.yRotO = lastYaw;
+    player.xRotO = lastPitch;
+}
+
+function dynamicTick() {
+    if (client.getMode(MOD + ":Mode") !== "Dynamic") return;
+    if (!senseReady || !mc.player) return;
+    if (b("Stop On Hit") && latched) {
+        lastYaw = mc.player.getYRot();
+        lastPitch = mc.player.getXRot();
+        return;
+    }
+    if (!holdingAttack() || !currentTarget()) return;
+    clearVanillaMouse();
+    mc.player.setYRot(lastYaw);
+    mc.player.setXRot(lastPitch);
+    mc.player.yRotO = lastYaw;
+    mc.player.xRotO = lastPitch;
 }
 
 // Full spring through normal tracking. Fade only on a real swipe so
@@ -1132,19 +1192,9 @@ function onRender(partialTicks) {
     var mode = client.getMode(MOD + ":Mode");
 
     if (mode === "Dynamic") {
-        if (b("Stop On Hit") && latched) {
-            syncSense(player);
-            return;
-        }
+        if (b("Stop On Hit") && latched) return;
         var rotD = rotationTo(eye.x, eyeY, eye.z, hit.x, hit.y, hit.z);
-        var aimedD = followDest(rotD.yaw, rotD.pitch, dt);
-        var dyaw = senseReady ? lastYaw : player.getYRot();
-        applyDynamic(
-            player,
-            dyaw + wrapDeg(aimedD.yaw - dyaw),
-            aimedD.pitch,
-            onBox && !b("Stop On Hit")
-        );
+        applyDynamic(player, rotD.yaw, rotD.pitch, onBox);
         return;
     }
 
@@ -1241,6 +1291,7 @@ events.on("tick", function () {
         var t = pickTarget();
         cachedTargetId = t ? t.getId() : -1;
         if (cachedTargetId !== -1) stickyId = cachedTargetId;
+        dynamicTick();
     } catch (e) {
         cachedTargetId = -1;
         log("[WindAim] " + e);
