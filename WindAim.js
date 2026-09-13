@@ -7,7 +7,16 @@ var LivingEntity = Java.type("net.minecraft.world.entity.LivingEntity");
 var Player = Java.type("net.minecraft.world.entity.player.Player");
 var Monster = Java.type("net.minecraft.world.entity.monster.Monster");
 var ArmorStand = Java.type("net.minecraft.world.entity.decoration.ArmorStand");
+var SwordItem = Java.type("net.minecraft.world.item.SwordItem");
+var AxeItem = Java.type("net.minecraft.world.item.AxeItem");
+var PickaxeItem = Java.type("net.minecraft.world.item.PickaxeItem");
+var ShovelItem = Java.type("net.minecraft.world.item.ShovelItem");
+var HoeItem = Java.type("net.minecraft.world.item.HoeItem");
 var HitType = Java.type("net.minecraft.world.phys.HitResult$Type");
+var Vec3 = Java.type("net.minecraft.world.phys.Vec3");
+var ClipContext = Java.type("net.minecraft.world.level.ClipContext");
+var ClipBlock = Java.type("net.minecraft.world.level.ClipContext$Block");
+var ClipFluid = Java.type("net.minecraft.world.level.ClipContext$Fluid");
 var System = Java.type("java.lang.System");
 
 var RAD = 180 / Math.PI;
@@ -28,9 +37,11 @@ client.registerMultiSelectDefault(MOD, "Targets", ["Players"], "Players", "Livin
 client.registerMode(MOD, "Select", "Angle", "Angle", "Distance");
 client.registerSlider(MOD, "FOV", 90, 10, 360, 1);
 client.registerMode(MOD, "Axis", "Both", "Both", "X", "Y");
-client.registerBoolean(MOD, "Hold", true);
+client.registerBoolean(MOD, "Hold Attack", true);
+client.registerMultiSelectDefault(MOD, "Tools", [], "Sword", "Axe", "Pickaxe", "Shovel", "Hoe");
 client.registerBoolean(MOD, "Skip Mining", true);
 client.registerBoolean(MOD, "Stop On Hit", true);
+client.registerBoolean(MOD, "Walls", true);
 
 var wind = null;
 var stickyId = -1;
@@ -89,7 +100,7 @@ function frameDt() {
 }
 
 function holdingAttack() {
-    if (!b("Hold")) return true;
+    if (!b("Hold Attack")) return true;
     // KeyMapping.isDown() can stay true after release (clickCount / consumeClick).
     // Read the bound attack key from GLFW so Hold follows the physical button.
     try {
@@ -108,6 +119,23 @@ function holdingAttack() {
             return false;
         }
     }
+}
+
+function holdingTool() {
+    var sel = client.getMulti(MOD + ":Tools");
+    if (!sel || sel.length === 0) return true;
+    try {
+        var item = mc.player.getMainHandItem().getItem();
+        for (var i = 0; i < sel.length; i++) {
+            var t = sel[i];
+            if (t === "Sword" && Java.isType(item, SwordItem)) return true;
+            if (t === "Axe" && Java.isType(item, AxeItem)) return true;
+            if (t === "Pickaxe" && Java.isType(item, PickaxeItem)) return true;
+            if (t === "Shovel" && Java.isType(item, ShovelItem)) return true;
+            if (t === "Hoe" && Java.isType(item, HoeItem)) return true;
+        }
+    } catch (e) {}
+    return false;
 }
 
 function isMining() {
@@ -510,10 +538,22 @@ function isFiltered(entity) {
         var theirTeam = entity.getTeam();
         if (myTeam && theirTeam && myTeam === theirTeam) return true;
     } catch (e) {}
-    try {
-        if (!mc.player.hasLineOfSight(entity)) return true;
-    } catch (e) {}
     return false;
+}
+
+function wallBetween(x0, y0, z0, x1, y1, z1) {
+    try {
+        var from = new Vec3(x0, y0, z0);
+        var to = new Vec3(x1, y1, z1);
+        var hit = mc.level.clip(new ClipContext(from, to, ClipBlock.COLLIDER, ClipFluid.NONE, mc.player));
+        if (hit.getType() === HitType.MISS) return false;
+        var loc = hit.getLocation();
+        var hitDist = hypot3(loc.x - x0, loc.y - y0, loc.z - z0);
+        var aimDist = hypot3(x1 - x0, y1 - y0, z1 - z0);
+        return hitDist + 0.08 < aimDist;
+    } catch (e) {
+        return false;
+    }
 }
 
 function listEntities() {
@@ -538,6 +578,7 @@ function stillValid(e, player, slack) {
     if (dist > n("Range") || dist < 0.15) return false;
     var view = n("FOV");
     if (view < 360 && angleToPoint(player, pt.x, pt.y, pt.z) > view * 0.5 + slack) return false;
+    if (b("Walls") && wallBetween(eyeX, eyeY, eyeZ, pt.x, pt.y, pt.z)) return false;
     return true;
 }
 
@@ -590,6 +631,11 @@ function onRender(partialTicks) {
         return;
     }
     if (!holdingAttack()) {
+        clearAim();
+        syncSense(mc.player);
+        return;
+    }
+    if (!holdingTool()) {
         clearAim();
         syncSense(mc.player);
         return;

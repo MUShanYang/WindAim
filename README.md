@@ -19,8 +19,10 @@ BBB
 | Select | `Angle` 视线最近 / `Distance` 距离最近 |
 | FOV | 瞄准视角，超出不瞄 |
 | Axis | `Both` / `X`（只 yaw） / `Y`（只 pitch） |
-| Hold | 按住攻击才瞄 |
+| Hold Attack | 按住攻击才瞄 |
+| Tools | 只在手持所选工具时瞄（不选则不限制） |
 | Skip Mining | 挖方块时不瞄 |
 | Stop On Hit | 准星已在碰撞箱上则不再控鼠标 |
+| Walls | 隔墙不瞄 |
 
 瞄准路径参考 [WindMouse](https://github.com/AsfhtgkDavid/windmouse)（GPLv3，原算法 [Ben Land](https://ben.land/post/2021/04/25/windmouse-human-mouse-movement/)）。
