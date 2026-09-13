@@ -17,7 +17,12 @@ var Vec3 = Java.type("net.minecraft.world.phys.Vec3");
 var ClipContext = Java.type("net.minecraft.world.level.ClipContext");
 var ClipBlock = Java.type("net.minecraft.world.level.ClipContext$Block");
 var ClipFluid = Java.type("net.minecraft.world.level.ClipContext$Fluid");
+var AABB = Java.type("net.minecraft.world.phys.AABB");
 var System = Java.type("java.lang.System");
+var GLFW = null;
+try {
+    GLFW = Java.type("org.lwjgl.glfw.GLFW");
+} catch (e) {}
 
 var RAD = 180 / Math.PI;
 
@@ -31,7 +36,7 @@ client.describeModule(MOD,
 );
 
 client.registerMode(MOD, "Mode", "WindMouse", "WindMouse", "Lock", "Dynamic");
-client.registerSlider(MOD, "Speed", 10, 1, 20, 0.5);
+client.registerSlider(MOD, "Speed", 10, 1, 90, 0.5);
 client.registerSlider(MOD, "Range", 6, 1, 64, 0.5);
 client.registerMultiSelectDefault(MOD, "Targets", ["Players"], "Players", "Living", "Monsters");
 client.registerMode(MOD, "Select", "Angle", "Angle", "Distance");
@@ -42,15 +47,26 @@ client.registerMultiSelectDefault(MOD, "Tools", [], "Sword", "Axe", "Pickaxe", "
 client.registerBoolean(MOD, "Skip Mining", true);
 client.registerBoolean(MOD, "Stop On Hit", true);
 client.registerBoolean(MOD, "Walls", true);
+client.registerBoolean(MOD, "Predict", true);
+client.registerBoolean(MOD, "Predict Box", true);
+try {
+    client.hideProperty(MOD + ":Show Predict");
+} catch (e) {}
 
 var wind = null;
 var stickyId = -1;
 var motionHist = {};
 var lastNs = 0;
 var predCache = { id: -1, tick: -1, pos: null };
+var predSmooth = { id: -1, tick: -1, from: null, to: null };
 var lastYaw = 0;
 var lastPitch = 0;
 var senseReady = false;
+var cachedTargetId = -1;
+var debugBox = null;
+var wantPlayers = true;
+var wantLiving = false;
+var wantMonsters = false;
 
 function n(label) {
     return client.getNumber(MOD + ":" + label);
@@ -104,7 +120,7 @@ function holdingAttack() {
     // KeyMapping.isDown() can stay true after release (clickCount / consumeClick).
     // Read the bound attack key from GLFW so Hold follows the physical button.
     try {
-        var GLFW = Java.type("org.lwjgl.glfw.GLFW");
+        if (!GLFW) return !!mc.mouseHandler.isLeftPressed();
         var handle = mc.getWindow().getWindow();
         var k = mc.options.keyAttack.getKey();
         var name = k.getName();
@@ -165,6 +181,9 @@ function clearAim() {
     stickyId = -1;
     predCache = { id: -1, tick: -1, pos: null };
     senseReady = false;
+    cachedTargetId = -1;
+    debugBox = null;
+    predSmooth = { id: -1, tick: -1, from: null, to: null };
 }
 
 function syncSense(player) {
@@ -220,6 +239,7 @@ function applyDynamic(player, destYaw, destPitch, onBox) {
     var errYaw = wrapDeg(destYaw - lastYaw);
     var errPitch = destPitch - lastPitch;
     var intensity = n("Speed") / 10;
+    if (intensity > 2.4) intensity = 2.4;
 
     var sYaw = axisScale(errYaw, dYaw, onBox, false, intensity);
     var sPitch = axisScale(errPitch, dPitch, onBox, true, intensity);
@@ -268,6 +288,59 @@ function windStep(destX, destY, speed, dt) {
     }
     wind.x += wind.vx * dt;
     wind.y += wind.vy * dt;
+}
+
+function lockStep(destX, destY, speed, dt) {
+    var dx = destX - wind.x;
+    var dy = destY - wind.y;
+    var dist = hypot2(dx, dy);
+    var spd = hypot2(wind.vx, wind.vy);
+    if (dist < 0.015 && spd < 0.6) {
+        wind.x = destX;
+        wind.y = destY;
+        wind.vx = 0;
+        wind.vy = 0;
+        return;
+    }
+    var omega = 10 + speed * 1.35;
+    wind.vx += dx * omega * omega * dt - 2 * omega * wind.vx * dt;
+    wind.vy += dy * omega * omega * dt - 2 * omega * wind.vy * dt;
+    var maxV = 50 + speed * 28;
+    spd = hypot2(wind.vx, wind.vy);
+    if (spd > maxV && spd > 1e-6) {
+        wind.vx *= maxV / spd;
+        wind.vy *= maxV / spd;
+    }
+    wind.x += wind.vx * dt;
+    wind.y += wind.vy * dt;
+}
+
+function smoothPred(entity, pt) {
+    if (!b("Predict")) return null;
+    var to = predictPos(entity);
+    var tick = mc.player.tickCount;
+    if (predSmooth.id !== entity.getId()) {
+        predSmooth.id = entity.getId();
+        predSmooth.tick = tick;
+        predSmooth.from = to;
+        predSmooth.to = to;
+        return to;
+    }
+    if (predSmooth.tick !== tick) {
+        predSmooth.from = predSmooth.to;
+        predSmooth.to = to;
+        predSmooth.tick = tick;
+    }
+    var a = predSmooth.from;
+    var c = predSmooth.to;
+    if (!a || !c) return to;
+    if (pt < 0) pt = 0;
+    if (pt > 1) pt = 1;
+    return {
+        x: a.x + (c.x - a.x) * pt,
+        y: a.y + (c.y - a.y) * pt,
+        z: a.z + (c.z - a.z) * pt
+    };
 }
 
 function entityName(e) {
@@ -556,7 +629,18 @@ function wallBetween(x0, y0, z0, x1, y1, z1) {
     }
 }
 
+function refreshWanted() {
+    wantPlayers = hasTargetType("Players");
+    wantLiving = hasTargetType("Living");
+    wantMonsters = hasTargetType("Monsters");
+}
+
 function listEntities() {
+    if (wantPlayers && !wantLiving && !wantMonsters) {
+        try {
+            return Java.from(mc.level.players());
+        } catch (e) {}
+    }
     try {
         return Java.from(mc.level.entitiesForRendering());
     } catch (e) {
@@ -568,7 +652,7 @@ function listEntities() {
     }
 }
 
-function stillValid(e, player, slack) {
+function stillValidCheap(e, player, slack) {
     if (!e || isFiltered(e) || !isWanted(e)) return false;
     var eyeX = player.getX();
     var eyeY = player.getEyeY();
@@ -578,38 +662,56 @@ function stillValid(e, player, slack) {
     if (dist > n("Range") || dist < 0.15) return false;
     var view = n("FOV");
     if (view < 360 && angleToPoint(player, pt.x, pt.y, pt.z) > view * 0.5 + slack) return false;
-    if (b("Walls") && wallBetween(eyeX, eyeY, eyeZ, pt.x, pt.y, pt.z)) return false;
-    return true;
+    return pt;
 }
 
 function pickTarget() {
     var player = mc.player;
     var select = client.getMode(MOD + ":Select");
+    refreshWanted();
 
     if (stickyId !== -1 && select !== "Angle") {
         var held = mc.level.getEntity(stickyId);
-        if (stillValid(held, player, 25)) return held;
+        var heldPt = stillValidCheap(held, player, 25);
+        if (heldPt) {
+            if (!b("Walls") || !wallBetween(player.getX(), player.getEyeY(), player.getZ(), heldPt.x, heldPt.y, heldPt.z)) {
+                return held;
+            }
+        }
     }
 
     var entities = listEntities();
-    var best = null;
-    var bestScore = 1e9;
+    var ranked = [];
     for (var i = 0; i < entities.length; i++) {
         var e = entities[i];
-        if (!stillValid(e, player, 0)) continue;
-        var hit = aimPoint(e, player.getX(), player.getEyeY(), player.getZ(), 1, null);
-        var score;
-        if (select === "Distance") {
-            score = hypot3(hit.x - player.getX(), hit.y - player.getEyeY(), hit.z - player.getZ());
-        } else {
-            score = angleToPoint(player, hit.x, hit.y, hit.z);
-        }
-        if (score < bestScore) {
-            bestScore = score;
-            best = e;
-        }
+        var hit = stillValidCheap(e, player, 0);
+        if (!hit) continue;
+        var score = select === "Distance"
+            ? hypot3(hit.x - player.getX(), hit.y - player.getEyeY(), hit.z - player.getZ())
+            : angleToPoint(player, hit.x, hit.y, hit.z);
+        ranked.push({ e: e, score: score, hit: hit });
     }
-    return best;
+    ranked.sort(function (a, c) {
+        return a.score - c.score;
+    });
+
+    if (ranked.length === 0) return null;
+    if (!b("Walls")) return ranked[0].e;
+
+    var limit = ranked.length < 8 ? ranked.length : 8;
+    var eyeX = player.getX();
+    var eyeY = player.getEyeY();
+    var eyeZ = player.getZ();
+    for (var j = 0; j < limit; j++) {
+        var cand = ranked[j];
+        if (!wallBetween(eyeX, eyeY, eyeZ, cand.hit.x, cand.hit.y, cand.hit.z)) return cand.e;
+    }
+    return null;
+}
+
+function currentTarget() {
+    if (cachedTargetId === -1 || !mc.level) return null;
+    return mc.level.getEntity(cachedTargetId);
 }
 
 function applyRot(player, yaw, pitch) {
@@ -652,7 +754,7 @@ function onRender(partialTicks) {
     if (pt > 1) pt = 1;
 
     var player = mc.player;
-    var target = pickTarget();
+    var target = currentTarget();
     if (!target) {
         clearAim();
         syncSense(player);
@@ -666,7 +768,13 @@ function onRender(partialTicks) {
         senseReady = false;
     }
 
-    var pred = predictPos(target);
+    var pred = smoothPred(target, pt);
+    if (b("Predict Box") && pred) {
+        var pb = worldBox(target, pt, pred);
+        debugBox = new AABB(pb.minX, pb.minY, pb.minZ, pb.maxX, pb.maxY, pb.maxZ);
+    } else {
+        debugBox = null;
+    }
     var onBox = lookOnBox(player, target, pt, pred);
     var eye = lerpEntity(player, pt);
     var eyeY = eye.y + player.getEyeHeight();
@@ -694,23 +802,12 @@ function onRender(partialTicks) {
         return;
     }
 
-    if (b("Stop On Hit") && onBox) {
-        if (wind) resetWind(player.getYRot(), player.getXRot());
-        return;
-    }
-
     var hit = aimPoint(target, eye.x, eyeY, eye.z, pt, pred);
     var rot = rotationTo(eye.x, eyeY, eye.z, hit.x, hit.y, hit.z);
-    var destYaw = player.getYRot() + wrapDeg(rot.yaw - player.getYRot());
     var destPitch = rot.pitch;
 
-    if (mode === "Lock") {
-        applyRot(player, destYaw, destPitch);
-        return;
-    }
-
     if (!wind) resetWind(player.getYRot(), player.getXRot());
-    destYaw = wind.x + wrapDeg(rot.yaw - wind.x);
+    var destYaw = wind.x + wrapDeg(rot.yaw - wind.x);
     var axis = client.getMode(MOD + ":Axis");
     if (axis === "X") {
         destPitch = wind.y;
@@ -722,17 +819,41 @@ function onRender(partialTicks) {
         wind.vx = 0;
         wind.wx = 0;
     }
-    windStep(destYaw, destPitch, n("Speed"), dt);
+
+    if (b("Stop On Hit") && onBox) {
+        var err = hypot2(wrapDeg(rot.yaw - wind.x), destPitch - wind.y);
+        var spd = hypot2(wind.vx, wind.vy);
+        if (err < 1.4 && spd < 10) {
+            resetWind(player.getYRot(), player.getXRot());
+            return;
+        }
+    }
+
+    if (mode === "Lock") lockStep(destYaw, destPitch, n("Speed"), dt);
+    else windStep(destYaw, destPitch, n("Speed"), dt);
     applyRot(player, wind.x, clamp(wind.y, -90, 90));
 }
 
 events.on("tick", function () {
     pruneHist();
+    if (!client.isEnabled(MOD) || !mc.player || !mc.level) {
+        cachedTargetId = -1;
+        return;
+    }
+    try {
+        var t = pickTarget();
+        cachedTargetId = t ? t.getId() : -1;
+        if (cachedTargetId !== -1) stickyId = cachedTargetId;
+    } catch (e) {
+        cachedTargetId = -1;
+        log("[WindAim] " + e);
+    }
 });
 
 events.on("render3d", function (partialTicks) {
     try {
         onRender(partialTicks);
+        if (debugBox) render.drawBox(debugBox, 0xAA22FF88);
     } catch (e) {
         log("[WindAim] " + e);
     }
