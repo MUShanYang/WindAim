@@ -10,8 +10,8 @@ BBB
 
 | 项 | 说明 |
 |---|---|
-| Mode | `WindMouse` 曲线贴近 / `Lock` 直接锁到碰撞箱 |
-| Speed | WindMouse 整体转头速度 |
+| Mode | `WindMouse` 曲线贴近 / `Lock` 直接锁到碰撞箱 / `Dynamic` 改鼠标灵敏度 |
+| Speed | 移动速度（WindMouse 转头速度；Dynamic 辅助强度） |
 | Targets | Players / Living / Monsters |
 | Hold | 按住攻击键才瞄准（关掉则模块开启就瞄） |
 | Skip Mining | 挖方块时不瞄 |

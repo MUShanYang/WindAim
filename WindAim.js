@@ -1,6 +1,5 @@
 // WindAim — Combat aim module.
-// Modes: WindMouse (curved) / Lock (snap to closest point on AABB).
-// Stops while mining and while the look ray already hits the box.
+// Modes: WindMouse (curved) / Lock (snap) / Dynamic (scale mouse sense per axis).
 
 var MOD = "WindAim";
 var RANGE = 6;
@@ -23,10 +22,11 @@ client.describeModule(MOD,
     "Aim at the closest point on the hitbox.\n\n" +
     "- **WindMouse**: curved human-like path\n" +
     "- **Lock**: snap onto the box\n" +
-    "- Does nothing while the crosshair is already on the box"
+    "- **Dynamic**: raise mouse sense while acquiring, slow it on the box\n" +
+    "- WindMouse/Lock do nothing while the crosshair is already on the box"
 );
 
-client.registerMode(MOD, "Mode", "WindMouse", "WindMouse", "Lock");
+client.registerMode(MOD, "Mode", "WindMouse", "WindMouse", "Lock", "Dynamic");
 client.registerSlider(MOD, "Speed", 10, 1, 20, 0.5);
 client.registerMultiSelectDefault(MOD, "Targets", ["Players"], "Players", "Living", "Monsters");
 client.registerBoolean(MOD, "Hold", true);
@@ -37,6 +37,9 @@ var stickyId = -1;
 var motionHist = {};
 var lastNs = 0;
 var predCache = { id: -1, tick: -1, pos: null };
+var lastYaw = 0;
+var lastPitch = 0;
+var senseReady = false;
 
 function n(label) {
     return client.getNumber(MOD + ":" + label);
@@ -122,6 +125,71 @@ function clearAim() {
     wind = null;
     stickyId = -1;
     predCache = { id: -1, tick: -1, pos: null };
+    senseReady = false;
+}
+
+function syncSense(player) {
+    lastYaw = player.getYRot();
+    lastPitch = player.getXRot();
+    senseReady = true;
+}
+
+function boxCenter(box) {
+    return {
+        x: (box.minX + box.maxX) * 0.5,
+        y: (box.minY + box.maxY) * 0.5,
+        z: (box.minZ + box.maxZ) * 0.5
+    };
+}
+
+// Per-axis mouse scale. Same-sign delta vs error = moving toward the aim point.
+// Yaw boosts harder for tracking; pitch sticks harder so it does not flick off.
+function axisScale(error, delta, onBox, isPitch, intensity) {
+    if (Math.abs(delta) < 0.0005) return 1;
+    var toward = delta * error > 0;
+    var absErr = Math.abs(error);
+
+    if (onBox) {
+        var stay = isPitch ? 0.16 : 0.22;
+        var slide = isPitch ? 0.38 : 0.48;
+        stay = clamp(stay / (0.55 + intensity * 0.12), 0.08, 0.28);
+        slide = clamp(slide / (0.7 + intensity * 0.08), 0.22, 0.55);
+        return toward ? slide : stay;
+    }
+
+    if (absErr > 42) return 1;
+    var t = 1 - absErr / 42;
+    t = t * t;
+    if (toward) {
+        var boost = (isPitch ? 0.45 : 0.85) * intensity * t;
+        return clamp(1 + boost, 1, 2.4);
+    }
+    var resist = (isPitch ? 0.4 : 0.28) * intensity * t;
+    return clamp(1 - resist, 0.25, 1);
+}
+
+function applyDynamic(player, destYaw, destPitch, onBox) {
+    var yaw = player.getYRot();
+    var pitch = player.getXRot();
+    if (!senseReady) {
+        syncSense(player);
+        return;
+    }
+
+    var dYaw = wrapDeg(yaw - lastYaw);
+    var dPitch = pitch - lastPitch;
+    var errYaw = wrapDeg(destYaw - lastYaw);
+    var errPitch = destPitch - lastPitch;
+    var intensity = n("Speed") / 10;
+
+    var sYaw = axisScale(errYaw, dYaw, onBox, false, intensity);
+    var sPitch = axisScale(errPitch, dPitch, onBox, true, intensity);
+
+    var outYaw = lastYaw + dYaw * sYaw;
+    var outPitch = clamp(lastPitch + dPitch * sPitch, -90, 90);
+    applyRot(player, outYaw, outPitch);
+    lastYaw = outYaw;
+    lastPitch = outPitch;
 }
 
 function windStep(destX, destY, speed, dt) {
@@ -501,13 +569,18 @@ function onRender(partialTicks) {
     var dt = frameDt();
     if (!client.isEnabled(MOD)) return;
     if (!mc.player || !mc.level) return;
-    if (!mc.mouseHandler.isMouseGrabbed()) return;
+    if (!mc.mouseHandler.isMouseGrabbed()) {
+        senseReady = false;
+        return;
+    }
     if (!holdingAttack()) {
         clearAim();
+        syncSense(mc.player);
         return;
     }
     if (b("Skip Mining") && isMining()) {
         clearAim();
+        syncSense(mc.player);
         return;
     }
 
@@ -520,6 +593,7 @@ function onRender(partialTicks) {
     var target = pickTarget();
     if (!target) {
         clearAim();
+        syncSense(player);
         return;
     }
 
@@ -527,22 +601,43 @@ function onRender(partialTicks) {
     if (id !== stickyId) {
         stickyId = id;
         wind = null;
+        senseReady = false;
     }
 
     var pred = predictPos(target);
-    if (lookOnBox(player, target, pt, pred)) {
+    var onBox = lookOnBox(player, target, pt, pred);
+    var eye = lerpEntity(player, pt);
+    var eyeY = eye.y + player.getEyeHeight();
+    var mode = client.getMode(MOD + ":Mode");
+
+    if (mode === "Dynamic") {
+        var aim;
+        if (onBox) {
+            aim = boxCenter(worldBox(target, pt, pred));
+        } else {
+            aim = aimPoint(target, eye.x, eyeY, eye.z, pt, pred);
+        }
+        var rotD = rotationTo(eye.x, eyeY, eye.z, aim.x, aim.y, aim.z);
+        var dyaw = senseReady ? lastYaw : player.getYRot();
+        applyDynamic(
+            player,
+            dyaw + wrapDeg(rotD.yaw - dyaw),
+            rotD.pitch,
+            onBox
+        );
+        return;
+    }
+
+    if (onBox) {
         wind = null;
         return;
     }
 
-    var eye = lerpEntity(player, pt);
-    var eyeY = eye.y + player.getEyeHeight();
     var hit = aimPoint(target, eye.x, eyeY, eye.z, pt, pred);
     var rot = rotationTo(eye.x, eyeY, eye.z, hit.x, hit.y, hit.z);
     var destYaw = player.getYRot() + wrapDeg(rot.yaw - player.getYRot());
     var destPitch = rot.pitch;
 
-    var mode = client.getMode(MOD + ":Mode");
     if (mode === "Lock") {
         applyRot(player, destYaw, destPitch);
         return;
@@ -571,4 +666,5 @@ events.on("disable", function (name) {
     clearAim();
     motionHist = {};
     lastNs = 0;
+    senseReady = false;
 });
