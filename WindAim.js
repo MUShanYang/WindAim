@@ -82,6 +82,8 @@ var debugBox = null;
 var wantPlayers = true;
 var wantLiving = false;
 var wantMonsters = false;
+var boxQueryOk = 1;
+var missTicks = 0;
 var lastMx = 0;
 var lastMy = 0;
 var mouseInit = false;
@@ -883,33 +885,33 @@ function predictPos(entity, pt) {
     return { x: x, y: y, z: z };
 }
 
-function isWanted(entity) {
-    if (!Java.isType(entity, LivingEntity)) return false;
-    if (Java.isType(entity, ArmorStand)) return false;
-    if (entity.getId() === mc.player.getId()) return false;
-    if (mc.cameraEntity && entity.getId() === mc.cameraEntity.getId()) return false;
+function isWanted(entity, ctx) {
+    var id = entity.getId();
+    if (id === ctx.selfId) return false;
+    if (ctx.camId !== -1 && id === ctx.camId) return false;
     if (!entity.isAlive() || entity.isDeadOrDying()) return false;
     if (entity.isSpectator()) return false;
+    if (ctx.playersOnly) return true;
+    if (!Java.isType(entity, LivingEntity)) return false;
+    if (Java.isType(entity, ArmorStand)) return false;
     if (entity.getBbWidth() < 0.2) return false;
 
     var isPlayer = Java.isType(entity, Player);
-    var isMonster = Java.isType(entity, Monster);
-    if (isPlayer && hasTargetType("Players")) return true;
-    if (isMonster && hasTargetType("Monsters")) return true;
-    if (!isPlayer && hasTargetType("Living")) return true;
-    return false;
+    if (isPlayer) return wantPlayers;
+    if (wantMonsters && Java.isType(entity, Monster)) return true;
+    return wantLiving && !isPlayer;
 }
 
-function isFiltered(entity) {
-    if (Java.isType(entity, Player)) {
+function isFiltered(entity, ctx) {
+    if (ctx.playersOnly || Java.isType(entity, Player)) {
         var name = entityName(entity);
         if (client.isFriend(name)) return true;
         if (stripCodes(name).length < 1) return true;
     }
+    if (!ctx.myTeam) return false;
     try {
-        var myTeam = mc.player.getTeam();
         var theirTeam = entity.getTeam();
-        if (myTeam && theirTeam && myTeam === theirTeam) return true;
+        if (theirTeam && ctx.myTeam === theirTeam) return true;
     } catch (e) {}
     return false;
 }
@@ -935,119 +937,205 @@ function refreshWanted() {
     wantMonsters = hasTargetType("Monsters");
 }
 
-function listEntities() {
-    if (wantPlayers && !wantLiving && !wantMonsters) {
-        try {
-            return Java.from(mc.level.players());
-        } catch (e) {}
-    }
+function makeScanCtx(player) {
+    refreshWanted();
+    var range = n("Range");
+    var fov = n("FOV");
+    var myTeam = null;
     try {
-        return Java.from(mc.level.entitiesForRendering());
-    } catch (e) {
-        try {
-            return Java.from(mc.level.players());
-        } catch (e2) {
-            return [];
-        }
+        myTeam = player.getTeam();
+    } catch (e) {}
+    var camId = -1;
+    try {
+        if (mc.cameraEntity) camId = mc.cameraEntity.getId();
+    } catch (e2) {}
+    return {
+        player: player,
+        range: range,
+        fov: fov,
+        fovHalf: fov * 0.5,
+        walls: b("Walls"),
+        myTeam: myTeam,
+        selfId: player.getId(),
+        camId: camId,
+        playersOnly: wantPlayers && !wantLiving && !wantMonsters,
+        eyeX: player.getX(),
+        eyeY: player.getEyeY(),
+        eyeZ: player.getZ()
+    };
+}
+
+function forEachInList(list, fn) {
+    if (!list) return;
+    var n = list.size();
+    for (var i = 0; i < n; i++) {
+        var e = list.get(i);
+        if (e) fn(e);
     }
 }
 
-function stillValidCheap(e, player, slack, lookYaw, lookPitch) {
-    if (!e || isFiltered(e) || !isWanted(e)) return false;
-    var eyeX = player.getX();
-    var eyeY = player.getEyeY();
-    var eyeZ = player.getZ();
-    var pt = aimPoint(e, eyeX, eyeY, eyeZ, 1, null);
-    var dist = hypot3(pt.x - eyeX, pt.y - eyeY, pt.z - eyeZ);
-    if (dist > n("Range") || dist < 0.15) return false;
-    var view = n("FOV");
-    if (view < 360) {
-        var ang = lookYaw != null
-            ? angleFromLook(lookYaw, lookPitch, eyeX, eyeY, eyeZ, pt.x, pt.y, pt.z)
-            : angleToPoint(player, pt.x, pt.y, pt.z);
-        if (ang > view * 0.5 + slack) return false;
+function forEachNearby(ctx, fn) {
+    if (ctx.playersOnly) {
+        var padSq = (ctx.range + 3) * (ctx.range + 3);
+        forEachInList(mc.level.players(), function (e) {
+            var dx = e.getX() - ctx.eyeX;
+            var dy = e.getY() - ctx.eyeY;
+            var dz = e.getZ() - ctx.eyeZ;
+            if (dx * dx + dy * dy + dz * dz > padSq) return;
+            fn(e);
+        });
+        return;
     }
-    return pt;
+    if (boxQueryOk === 2) {
+        forEachInList(mc.level.getEntities(ctx.player, ctx.player.getBoundingBox().inflate(ctx.range + 2)), fn);
+        return;
+    }
+    if (boxQueryOk === 1) {
+        try {
+            var aabb = ctx.player.getBoundingBox().inflate(ctx.range + 2);
+            var found = mc.level.getEntities(ctx.player, aabb);
+            boxQueryOk = 2;
+            forEachInList(found, fn);
+            return;
+        } catch (err) {
+            boxQueryOk = 0;
+        }
+    }
+    var raw;
+    try {
+        raw = Java.from(mc.level.entitiesForRendering());
+    } catch (e2) {
+        return;
+    }
+    var pad = ctx.range + 4;
+    var padSq2 = pad * pad;
+    for (var i = 0; i < raw.length; i++) {
+        var e = raw[i];
+        if (!e) continue;
+        var dx2 = e.getX() - ctx.eyeX;
+        var dy2 = e.getY() - ctx.eyeY;
+        var dz2 = e.getZ() - ctx.eyeZ;
+        if (dx2 * dx2 + dy2 * dy2 + dz2 * dz2 > padSq2) continue;
+        fn(e);
+    }
+}
+
+function stillValidCheap(e, ctx, slack, lookYaw, lookPitch) {
+    if (!e || !isWanted(e, ctx) || isFiltered(e, ctx)) return false;
+    var eyeX = ctx.eyeX;
+    var eyeY = ctx.eyeY;
+    var eyeZ = ctx.eyeZ;
+    var hit = closestOnAABB(e.getBoundingBox(), eyeX, eyeY, eyeZ);
+    var dist = hypot3(hit.x - eyeX, hit.y - eyeY, hit.z - eyeZ);
+    if (dist > ctx.range || dist < 0.15) return false;
+    if (ctx.fov < 360) {
+        var ang = lookYaw != null
+            ? angleFromLook(lookYaw, lookPitch, eyeX, eyeY, eyeZ, hit.x, hit.y, hit.z)
+            : angleToPoint(ctx.player, hit.x, hit.y, hit.z);
+        if (ang > ctx.fovHalf + slack) return false;
+    }
+    return hit;
+}
+
+function visibleHit(ctx, e, slack, lookYaw, lookPitch) {
+    var hit = stillValidCheap(e, ctx, slack, lookYaw, lookPitch);
+    if (!hit) return null;
+    if (ctx.walls && wallBetween(ctx.eyeX, ctx.eyeY, ctx.eyeZ, hit.x, hit.y, hit.z)) return null;
+    return hit;
+}
+
+function preferSticky(a, c) {
+    var d = a.score - c.score;
+    if (Math.abs(d) < 0.08 && stickyId !== -1) {
+        if (a.e.getId() === stickyId) return -1;
+        if (c.e.getId() === stickyId) return 1;
+    }
+    return d;
+}
+
+function firstVisibleCand(ctx, list) {
+    if (list.length === 0) return null;
+    if (!ctx.walls) return list[0];
+    var lim = list.length < 8 ? list.length : 8;
+    for (var j = 0; j < lim; j++) {
+        var cand = list[j];
+        if (!wallBetween(ctx.eyeX, ctx.eyeY, ctx.eyeZ, cand.hit.x, cand.hit.y, cand.hit.z)) return cand;
+    }
+    return null;
+}
+
+function rankNearby(ctx, scoreOf, slack, lookYaw, lookPitch) {
+    var ranked = [];
+    forEachNearby(ctx, function (e) {
+        var hit = stillValidCheap(e, ctx, slack, lookYaw, lookPitch);
+        if (!hit) return;
+        ranked.push({ e: e, score: scoreOf(e, hit), hit: hit });
+    });
+    ranked.sort(preferSticky);
+    return ranked;
 }
 
 function pickTarget() {
     var player = mc.player;
     var select = client.getMode(MOD + ":Select");
-    refreshWanted();
+    var ctx = makeScanCtx(player);
 
-    if (select === "Smart") return pickSmart(player);
+    if (select === "Smart") return pickSmart(ctx);
 
-    if (stickyId !== -1 && select !== "Angle") {
-        var held = mc.level.getEntity(stickyId);
-        var heldPt = stillValidCheap(held, player, 25);
-        if (heldPt) {
-            if (!b("Walls") || !wallBetween(player.getX(), player.getEyeY(), player.getZ(), heldPt.x, heldPt.y, heldPt.z)) {
-                return held;
-            }
-        }
-    }
+    var held = stickyId !== -1 ? mc.level.getEntity(stickyId) : null;
+    var heldHit = held ? visibleHit(ctx, held, select === "Angle" ? 18 : 25) : null;
+    if (heldHit && select !== "Angle") return held;
 
-    var entities = listEntities();
-    var ranked = [];
-    for (var i = 0; i < entities.length; i++) {
-        var e = entities[i];
-        var hit = stillValidCheap(e, player, 0);
-        if (!hit) continue;
-        var score = select === "Distance"
-            ? hypot3(hit.x - player.getX(), hit.y - player.getEyeY(), hit.z - player.getZ())
+    var ranked = rankNearby(ctx, function (e, hit) {
+        return select === "Distance"
+            ? hypot3(hit.x - ctx.eyeX, hit.y - ctx.eyeY, hit.z - ctx.eyeZ)
             : angleToPoint(player, hit.x, hit.y, hit.z);
-        ranked.push({ e: e, score: score, hit: hit });
-    }
-    ranked.sort(function (a, c) {
-        return a.score - c.score;
-    });
-
-    if (ranked.length === 0) return null;
-    if (!b("Walls")) return ranked[0].e;
-
-    var limit = ranked.length < 8 ? ranked.length : 8;
-    var eyeX = player.getX();
-    var eyeY = player.getEyeY();
-    var eyeZ = player.getZ();
-    for (var j = 0; j < limit; j++) {
-        var cand = ranked[j];
-        if (!wallBetween(eyeX, eyeY, eyeZ, cand.hit.x, cand.hit.y, cand.hit.z)) return cand.e;
-    }
-    return null;
+    }, 0);
+    var best = firstVisibleCand(ctx, ranked);
+    if (!best) return heldHit ? held : null;
+    if (heldHit && select === "Angle" && heldScoreKeep(heldHit, best, player)) return held;
+    return best.e;
 }
 
-function pickSmart(player) {
+function heldScoreKeep(heldHit, best, player) {
+    var holdScore = angleToPoint(player, heldHit.x, heldHit.y, heldHit.z);
+    return holdScore <= best.score + 10;
+}
+
+function pickSmart(ctx) {
+    var player = ctx.player;
     var lookYaw = rawReady ? rawYaw : player.getYRot();
     var lookPitch = rawReady ? rawPitch : player.getXRot();
     var flickLen = hypot2(flickYawRate, flickPitchRate);
-    var eyeX = player.getX();
-    var eyeY = player.getEyeY();
-    var eyeZ = player.getZ();
+    var eyeX = ctx.eyeX;
+    var eyeY = ctx.eyeY;
+    var eyeZ = ctx.eyeZ;
     if (hitLockId !== -1 && System.nanoTime() < hitLockUntil) {
         var locked = mc.level.getEntity(hitLockId);
-        var lockPt = stillValidCheap(locked, player, 40, lookYaw, lookPitch);
-        if (lockPt && (!b("Walls") || !wallBetween(eyeX, eyeY, eyeZ, lockPt.x, lockPt.y, lockPt.z))) {
-            return locked;
-        }
+        if (visibleHit(ctx, locked, 40, lookYaw, lookPitch)) return locked;
     } else {
         hitLockId = -1;
         hitLockUntil = 0;
     }
-    var entities = listEntities();
+
+    var flicking = flickLen > 40;
+    var held = stickyId !== -1 ? mc.level.getEntity(stickyId) : null;
+    var heldHit = held ? visibleHit(ctx, held, 25, lookYaw, lookPitch) : null;
+    if (heldHit && !flicking) return held;
+
     var ahead = 0.18;
     var predYaw = lookYaw + flickYawRate * ahead;
     var predPitch = clamp(lookPitch + flickPitchRate * ahead, -90, 90);
-    var flicking = flickLen > 40;
+    var rayRange = ctx.range + 2;
     var ranked = [];
 
-    for (var i = 0; i < entities.length; i++) {
-        var e = entities[i];
-        var hit = stillValidCheap(e, player, flicking ? 20 : 0, lookYaw, lookPitch);
-        if (!hit) continue;
+    forEachNearby(ctx, function (e) {
+        var hit = stillValidCheap(e, ctx, flicking ? 20 : 0, lookYaw, lookPitch);
+        if (!hit) return;
         var dist = hypot3(hit.x - eyeX, hit.y - eyeY, hit.z - eyeZ);
         if (!flicking) {
             ranked.push({ e: e, score: dist, hit: hit, smart: false });
-            continue;
+            return;
         }
         var rot = rotationTo(eyeX, eyeY, eyeZ, hit.x, hit.y, hit.z);
         var errY = wrapDeg(rot.yaw - lookYaw);
@@ -1058,51 +1146,38 @@ function pickSmart(player) {
         if (errNow > 0.05) {
             align = (flickYawRate * errY + flickPitchRate * errP) / (flickLen * errNow);
         }
-        var box = worldBox(e, 1, null);
+        var box = e.getBoundingBox();
         var dir = lookDir(predYaw, predPitch);
         var onPath = align > 0.42 && errPred < errNow + 1;
-        var rayHit = rayHitsAABB(eyeX, eyeY, eyeZ, dir.x, dir.y, dir.z, box, n("Range") + 2);
+        var rayHit = rayHitsAABB(eyeX, eyeY, eyeZ, dir.x, dir.y, dir.z, box, rayRange);
         if (onPath || rayHit) ranked.push({ e: e, score: dist, hit: hit, smart: true });
-    }
-
-    ranked.sort(function (a, c) {
-        return a.score - c.score;
     });
 
-    function firstVisible(list) {
-        if (list.length === 0) return null;
-        if (!b("Walls")) return list[0].e;
-        var lim = list.length < 8 ? list.length : 8;
-        for (var j = 0; j < lim; j++) {
-            var cand = list[j];
-            if (!wallBetween(eyeX, eyeY, eyeZ, cand.hit.x, cand.hit.y, cand.hit.z)) return cand.e;
-        }
-        return null;
-    }
+    ranked.sort(preferSticky);
 
     if (flicking) {
         var flicked = [];
         for (var k = 0; k < ranked.length; k++) {
             if (ranked[k].smart) flicked.push(ranked[k]);
         }
-        var chosen = firstVisible(flicked);
-        if (chosen) return chosen;
+        var chosen = firstVisibleCand(ctx, flicked);
+        if (chosen) return chosen.e;
     }
 
-    if (stickyId !== -1) {
-        var held = mc.level.getEntity(stickyId);
-        var heldPt = stillValidCheap(held, player, 25, lookYaw, lookPitch);
-        if (heldPt && (!b("Walls") || !wallBetween(eyeX, eyeY, eyeZ, heldPt.x, heldPt.y, heldPt.z))) {
-            return held;
-        }
-    }
+    if (heldHit) return held;
 
     ranked.sort(function (a, c) {
         var aa = angleFromLook(lookYaw, lookPitch, eyeX, eyeY, eyeZ, a.hit.x, a.hit.y, a.hit.z);
         var bb = angleFromLook(lookYaw, lookPitch, eyeX, eyeY, eyeZ, c.hit.x, c.hit.y, c.hit.z);
-        return aa - bb;
+        var d = aa - bb;
+        if (Math.abs(d) < 0.08 && stickyId !== -1) {
+            if (a.e.getId() === stickyId) return -1;
+            if (c.e.getId() === stickyId) return 1;
+        }
+        return d;
     });
-    return firstVisible(ranked);
+    var best = firstVisibleCand(ctx, ranked);
+    return best ? best.e : null;
 }
 
 function currentTarget() {
@@ -1285,15 +1360,21 @@ events.on("tick", function () {
     pruneHist();
     if (!client.isEnabled(MOD) || !mc.player || !mc.level) {
         cachedTargetId = -1;
+        missTicks = 0;
         return;
     }
     try {
         var t = pickTarget();
-        cachedTargetId = t ? t.getId() : -1;
-        if (cachedTargetId !== -1) stickyId = cachedTargetId;
+        if (t) {
+            cachedTargetId = t.getId();
+            stickyId = cachedTargetId;
+            missTicks = 0;
+        } else {
+            missTicks++;
+            if (missTicks >= 3) cachedTargetId = -1;
+        }
         dynamicTick();
     } catch (e) {
-        cachedTargetId = -1;
         log("[WindAim] " + e);
     }
 });
@@ -1322,6 +1403,7 @@ events.on("render3d", function (partialTicks) {
 events.on("disable", function (name) {
     if (name !== MOD) return;
     clearAim();
+    missTicks = 0;
     motionHist = {};
     lastNs = 0;
     senseReady = false;
